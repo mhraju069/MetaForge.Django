@@ -75,7 +75,7 @@ class GetOtpView(APIView):
 class OtpVerifyView(APIView):
     def post(self, request):
         email = request.data.get('email')
-        otp_code = request.data.get('otp_code')
+        otp_code = request.data.get('otp')
 
         if not email or not otp_code:
             return Response(

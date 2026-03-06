@@ -54,7 +54,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = User
-        fields = "__all__"
+        exclude = ['password', 'block', 'is_active', 'is_staff', 'is_superuser', 'groups', 'user_permissions', 'date_joined']
         read_only_fields = ['id', 'email', 'role']
 
     def update(self, instance, validated_data):
