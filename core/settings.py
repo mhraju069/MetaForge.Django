@@ -18,6 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 STRIPE_PUBLIC_KEY = os.getenv('STRIPE_PUBLIC_KEY')
 STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY')
 DATA_UPLOAD_MAX_MEMORY_SIZE = 1048576
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY","A6rz49DCTMRctzby7-OW8TQWVrMrUJ8K1jFkJPG8NsM=")
 ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '*').split(',')
 STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
 CORS_ALLOW_HEADERS = list(default_headers) + ['ngrok-skip-browser-warning',]
@@ -40,6 +41,7 @@ INSTALLED_APPS = [
     'accounts',
     'payments',
     'subscriptions',
+    'socials',
 
 ]
 

@@ -1,6 +1,6 @@
 from django.utils import timezone
 from datetime import timedelta
-from .models import OTP, User
+from .models import *
 from django.core.mail import send_mail
 from django.conf import settings
 import json
@@ -172,3 +172,9 @@ def apple_login(identity_token, user_info_raw):
     except Exception as e:
         return None, str(e)
 
+
+def get_company(user):
+    try:
+        return Company.objects.filter(owner=user).first()
+    except:
+        return Employee.objects.filter(employee=user).first().company
