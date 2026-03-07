@@ -210,3 +210,24 @@ class FirebaseLoginView(APIView):
         else:
             return Response({'status': False,'log': 'Invalid or expired token'}, status=status.HTTP_400_BAD_REQUEST)
 
+
+class CompanyRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = CompanySerializer
+    permission_classes = [permissions.IsAuthenticated]
+    def get_object(self):
+        company, created = Company.objects.get_or_create(owner=self.request.user)
+        return company
+
+
+class EmployeeRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = EmployeeSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    def get_object(self):
+        return Employee.objects.filter(id=self.kwargs['pk']).first()
+
+
+class CompanyEmployeeListView(generics.ListAPIView):
+    serializer_class = EmployeeSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    def get_queryset(self):
+        return Employee.objects.filter(company=self.request.user.company).first()

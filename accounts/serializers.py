@@ -1,4 +1,4 @@
-from .models import User
+from .models import *
 from rest_framework import serializers
 
 
@@ -69,3 +69,17 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
         instance.save()
         return instance
+
+
+class CompanySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Company
+        fields = '__all__'
+        read_only_fields = ['id']
+
+
+class EmployeeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Employee
+        fields = '__all__'
+        read_only_fields = ['id']

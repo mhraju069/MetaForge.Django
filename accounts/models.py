@@ -99,3 +99,26 @@ class OTP(models.Model):
         return self.created_at + timedelta(minutes=3) < timezone.now()
 
 
+class Company(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='company')
+    logo = models.ImageField(upload_to='company_logos/', blank=True, null=True,)
+    name = models.CharField(max_length=200,verbose_name="Company Name",blank=True, null=True)
+    type = models.CharField(max_length=200,verbose_name="Company Type",blank=True, null=True)
+    description = models.TextField(blank=True, null=True,verbose_name="Company Description")
+    address = models.TextField(blank=True, null=True,verbose_name="Company Address")
+    employees = models.ManyToManyField(User, related_name='company_employees', blank=True)
+    
+    def __str__(self):
+        return self.name
+
+
+class Employee(models.Model):
+    PERMISSIONS = (('admin', 'Admin'),('editor', 'Editor'),('viewer', 'Viewer'),)
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employee = models.ForeignKey(User, on_delete=models.CASCADE, related_name='employee')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='company_employees')
+    permissions = models.CharField(max_length=10, choices=PERMISSIONS, default='viewer',verbose_name="Employee Permissions")
+    
+    

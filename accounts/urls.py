@@ -11,4 +11,7 @@ urlpatterns = [
     path('reset-password/', ResetPassword.as_view(), name='reset_password'),
     path('profile/', GetProfileView.as_view(), name='get_profile'),
     path('', FirebaseLoginView.as_view(), name='firebase_login'),
+    path('company/', CompanyRetrieveUpdateDestroyView.as_view(), name='company_detail'),
+    path('employee/', CompanyEmployeeListView.as_view(), name='employee'),
+    path('employee/<uuid:pk>/', EmployeeRetrieveUpdateDestroyView.as_view(), name='employee_detail'),
 ]
