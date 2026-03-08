@@ -10,6 +10,7 @@ class SocialAccount(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, related_name="socials",on_delete=models.CASCADE)
 
+    name = models.CharField(max_length=200,blank=True,null=True)
     platform = models.CharField(max_length=20, choices=PLATFORM_CHOICES)   
     account_id = models.CharField(max_length=200)
 

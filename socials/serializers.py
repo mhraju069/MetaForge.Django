@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import SocialAccount
+from .models import *
 from accounts.helper import get_company
 from core.utils import decrypt_token
 
@@ -18,9 +18,9 @@ class SocialAccountSerializer(serializers.ModelSerializer):
         return attrs
     
 
-class SocialPageSerializer(serializers.ModelSerializer):
+class SocialPostSerializer(serializers.ModelSerializer):
     class Meta:
-        model = SocialPage
+        model = SocialPost
         fields = "__all__"
         read_only_fields = ["id", "account", "created_at", "updated_at"]
     
@@ -28,22 +28,7 @@ class SocialPageSerializer(serializers.ModelSerializer):
         account = SocialAccount.objects.get(id=self.context["request"].data["account"])
         if not account:
             raise serializers.ValidationError({"account": "Account not found"})
-        if SocialPage.objects.filter(account=account, page_id=attrs["page_id"]).exists():
-            raise serializers.ValidationError({"page_id": "Page already exists"})
-        return attrs
-
-
-class SocialPostSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = SocialPost
-        fields = "__all__"
-        read_only_fields = ["id", "page", "created_at", "updated_at"]
-    
-    def validate(self, attrs):
-        page = SocialPage.objects.get(id=self.context["request"].data["page"])
-        if not page:
-            raise serializers.ValidationError({"page": "Page not found"})
-        if SocialPost.objects.filter(page=page, post_id=attrs["post_id"]).exists():
+        if SocialPost.objects.filter(account=account, post_id=attrs["post_id"]).exists():
             raise serializers.ValidationError({"post_id": "Post already exists"})
         return attrs
 
