@@ -20,3 +20,38 @@ class SocialAccount(models.Model):
 
     def __str__(self):
         return f"{self.company.owner.email} - {self.platform}"
+
+
+class SocialPage(models.Model):
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    account = models.ForeignKey(SocialAccount,related_name="pages",on_delete=models.CASCADE)
+    page_id = models.CharField(max_length=200)
+    name = models.CharField(max_length=200)
+    token = models.TextField()
+
+    def __str__(self):
+        return f"{self.name} - {self.account.platform}"
+
+
+class SocialPost(models.Model):
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    page = models.ForeignKey(SocialPage,related_name="posts",on_delete=models.CASCADE)
+    post_id = models.CharField(max_length=200)
+    caption = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.post_id} - {self.page.account.platform}"
+
+
+class PostMedia(models.Model):
+    post = models.ForeignKey(SocialPost,related_name="media",on_delete=models.CASCADE)
+    media = models.ImageField(upload_to="posts")
+
+    def __str__(self):
+        return f"{self.post.post_id} - {self.post.page.account.platform}"
+
+
