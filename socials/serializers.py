@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import *
 from accounts.helper import get_company
-from core.utils import decrypt_token
+from core.utils import decrypt_data
 
 class SocialAccountSerializer(serializers.ModelSerializer):
     class Meta:

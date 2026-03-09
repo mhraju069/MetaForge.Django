@@ -23,6 +23,8 @@ META_SECRET = os.getenv("META_SECRET","14353d74098dea33639724d9fa6b6324")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY","A6rz49DCTMRctzby7-OW8TQWVrMrUJ8K1jFkJPG8NsM=")
 ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '*').split(',')
 STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
+IG_APP_ID = os.getenv("IG_APP_ID","1361124205849276")
+IG_APP_SECRET = os.getenv("IG_APP_SECRET","72e4b0a015e73d802b264925894e464d")
 CORS_ALLOW_HEADERS = list(default_headers) + ['ngrok-skip-browser-warning',]
 CORS_ALLOW_ORIGINS =  os.getenv('CORS_ALLOW_ORIGINS', 'localhost:8000,localhost:3000').split(',')
 CSRF_TRUSTED_ORIGINS = os.getenv('CSRF_TRUSTED_ORIGINS', 'localhost:8000,localhost:3000').split(',')
