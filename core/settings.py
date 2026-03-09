@@ -14,17 +14,19 @@ from firebase_admin import credentials
 CORS_ALLOW_CREDENTIALS = True
 DEBUG = os.getenv('DEBUG', True)
 SECRET_KEY = os.getenv("SECRET_KEY")
+FRONTEND_URL = os.getenv("FRONTEND_URL","http://localhost:3000")
+BACKEND_URL = os.getenv("BACKEND_URL","http://localhost")
 BASE_DIR = Path(__file__).resolve().parent.parent
 STRIPE_PUBLIC_KEY = os.getenv('STRIPE_PUBLIC_KEY')
 STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY')
 DATA_UPLOAD_MAX_MEMORY_SIZE = 1048576
-META_ID = os.getenv("META_ID","1439953050939422")
-META_SECRET = os.getenv("META_SECRET","14353d74098dea33639724d9fa6b6324")
+META_ID = os.getenv("META_ID","712634711840488")
+META_SECRET = os.getenv("META_SECRET","dcf31fa4ad1794d5f114635ea22cd76c")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY","A6rz49DCTMRctzby7-OW8TQWVrMrUJ8K1jFkJPG8NsM=")
 ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '*').split(',')
 STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
-IG_APP_ID = os.getenv("IG_APP_ID","1361124205849276")
-IG_APP_SECRET = os.getenv("IG_APP_SECRET","72e4b0a015e73d802b264925894e464d")
+IG_APP_ID = os.getenv("IG_APP_ID","2083707059074457")
+IG_APP_SECRET = os.getenv("IG_APP_SECRET","ec1bc879a149e7bc7cdcc2a2c5012ec9")
 CORS_ALLOW_HEADERS = list(default_headers) + ['ngrok-skip-browser-warning',]
 CORS_ALLOW_ORIGINS =  os.getenv('CORS_ALLOW_ORIGINS', 'localhost:8000,localhost:3000').split(',')
 CSRF_TRUSTED_ORIGINS = os.getenv('CSRF_TRUSTED_ORIGINS', 'localhost:8000,localhost:3000').split(',')

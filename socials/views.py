@@ -1,17 +1,19 @@
-from django.shortcuts import render
+from django.shortcuts import render,redirect
 from core.utils import encrypt_data, decrypt_data
 from rest_framework.views import APIView
+from django.http import JsonResponse, HttpResponseRedirect
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from .models import SocialAccount
 from accounts.helper import get_company
+from accounts.models import Company
 from .serializers import SocialAccountSerializer
-import urllib.parse
+import urllib.parse , requests
 from uuid import UUID
 from django.conf import settings
 from django.urls import reverse
-# Create your views here.
+from .helper import subscribe_page_to_webhook
 
 
 class SocialAccountView(APIView):
@@ -62,8 +64,15 @@ class FacebookCallbackView(APIView):
         code = request.GET.get("code")
         error = request.GET.get("error")
         state_data = request.GET.get("state")
-        state = UUID(decrypt_data(state_data.split(",")[0]))
-        _from = decrypt_data(state_data.split(",")[1])
+
+        # Decrypt state (company_id + source platform)
+        try:
+            state = UUID(decrypt_data(state_data.split(",")[0]))
+            _from = decrypt_data(state_data.split(",")[1])
+        except Exception as e:
+            print(f"❌ State decryption failed: {e}")
+            return HttpResponseRedirect(f"{settings.FRONTEND_URL}/user/integrations")
+
         print(f"Facebook callback: code={code}, error={error}, state={state_data}, from={_from}")
 
         if error:
@@ -72,100 +81,102 @@ class FacebookCallbackView(APIView):
         if not code:
             return HttpResponseRedirect(f"{settings.FRONTEND_URL}/user/integrations")
 
+        # ── Step 1: Exchange code for short-lived access token ──
         token_url = "https://graph.facebook.com/v20.0/oauth/access_token"
-        # Dynamic redirect_uri to match the one sent in ConnectView
-        redirect_uri = request.build_absolute_uri(reverse("facebook_callback")).split('?')[0]
+        redirect_uri = request.build_absolute_uri(reverse("facebook_callback")).split("?")[0]
         if "ngrok" in redirect_uri and redirect_uri.startswith("http://"):
             redirect_uri = redirect_uri.replace("http://", "https://")
-        
-        params = {
+
+        resp = requests.get(token_url, params={
             "client_id": settings.META_ID,
             "redirect_uri": redirect_uri,
             "client_secret": settings.META_SECRET,
             "code": code,
-        }
-        
-        resp = requests.get(token_url, params=params)
+        })
         data = resp.json()
-        
+
         if "access_token" not in data:
             return JsonResponse({"error": "Token exchange failed", "details": data})
 
         user_access_token = data["access_token"]
 
+        # ── Debug: log granted scopes ──
+        debug_resp = requests.get(
+            "https://graph.facebook.com/v20.0/debug_token",
+            params={
+                "input_token": user_access_token,
+                "access_token": f"{settings.META_ID}|{settings.META_SECRET}",
+            }
+        )
 
-        # 1. Exchange short-lived User Access Token for Long-lived User Access Token
-        exchange_url = "https://graph.facebook.com/v20.0/oauth/access_token"
-        exchange_params = {
-            "grant_type": "fb_exchange_token",
-            "client_id": settings.META_ID,
-            "client_secret": settings.META_SECRET,
-            "fb_exchange_token": user_access_token,
-        }
-        
-        exchange_resp = requests.get(exchange_url, params=exchange_params)
-        exchange_data = exchange_resp.json()
-        long_lived_user_token = exchange_data.get("access_token", user_access_token)
+        # ── Step 2: Exchange for long-lived user token ──
+        exchange_resp = requests.get(
+            "https://graph.facebook.com/v20.0/oauth/access_token",
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": settings.META_ID,
+                "client_secret": settings.META_SECRET,
+                "fb_exchange_token": user_access_token,
+            }
+        )
+        long_lived_user_token = exchange_resp.json().get("access_token", user_access_token)
 
-        # 2. Get pages with Long-lived Page Tokens using Long-lived User Token
-        pages_url = "https://graph.facebook.com/v20.0/me/accounts"
-        pages_resp = requests.get(pages_url, params={"access_token": long_lived_user_token})
+        # ── Step 3: Fetch all pages ──
+        pages_resp = requests.get(
+            "https://graph.facebook.com/v20.0/me/accounts",
+            params={"access_token": long_lived_user_token}
+        )
         pages_data = pages_resp.json()
 
         if "data" not in pages_data:
             return JsonResponse({"error": "Failed to fetch pages", "details": pages_data})
 
+        pages = pages_data.get("data", [])
+        if not pages:
+            print("❌ No Facebook Pages found for this user token.")
+            if _from == "app":
+                return render(request, "redirect.html")
+            return redirect(f"{settings.FRONTEND_URL}/user/integrations?error=no_pages")
+
+        # ── Step 4: Resolve company ──
         try:
             company = Company.objects.get(id=state)
         except Company.DoesNotExist:
             return JsonResponse({"error": "Company not found"})
 
-        for page in pages_data["data"]:
-            page_id = page["id"]
-            page_name = page.get("name", "")
-            page_access_token = page["access_token"]
+        # ── Step 5: Save each page & subscribe to webhooks ──
 
-            fb_profile, created = SocialAccount.objects.update_or_create(
+        for page in pages:
+            page_id = page.get("id")
+            page_name = page.get("name", "")
+            page_access_token = page.get("access_token")
+
+            if not page_id or not page_access_token:
+                print(f"⚠️ Skipping page '{page_name}' — missing id or access_token.")
+                continue
+
+            SocialAccount.objects.update_or_create(
                 account_id=page_id,
                 platform="fb",
                 defaults={
                     "company": company,
                     "name": page_name,
-                    "account_id": page_id,
                     "token": page_access_token,
                 }
             )
-            print("✅ Facebook page " + page_name + " connected successfully")
+            print(f"✅ Facebook page '{page_name}' connected successfully.")
+
+            subscribe_page_to_webhook(page_id, page_access_token,page_name)
+
             break
 
-        #subscribe page to webhook
-        try:
-            subscribe_url = f"https://graph.facebook.com/v20.0/{page_id}/subscribed_apps"
-            params = {
-                "subscribed_fields": "messages,messaging_postbacks,messaging_optins,message_echoes",
-                "access_token": page_access_token
-            }
-            
-            response = requests.post(subscribe_url, params=params)
-            result = response.json()
-            
-            if result.get('success'):
-                print(f"✅ Facebook Page subscribed successfully")
-            else:
-                print(f"❌ Error subscribing page: {result}")
-                
-        except Exception as e:
-            print(f"❌ Error subscribing page: {e}")
-        
-        
         if _from == "app":
-            return render(request,'redirect.html')
-        else:
-            return redirect(f"{settings.FRONTEND_URL}/user/chat-profile")
+            return render(request, "redirect.html")
+        return redirect(f"{settings.FRONTEND_URL}/user/chat-profile")
 
 
 class InstagramConnectView(APIView):
-    permission_classes = [IsAuthenticated, IsEmployeeAndCanManageAPI]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
 
@@ -200,7 +211,7 @@ class InstagramConnectView(APIView):
 
 
 class InstagramCallbackView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = []
 
     def get(self, request):
         code = request.GET.get("code")
