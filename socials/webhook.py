@@ -22,11 +22,63 @@ router = APIRouter()
 # Helper to run Django ORM in async
 sync_check_account = sync_to_async(check_account)
 
-async def generate_ai_reply(user_message: str, account_id: str = None):
-    """Generate a reply using PRO-grade Vector Semantic Search."""
+async def process_multimodal_description(media_url: str, media_type: str):
+    """
+    Use a Vision/Audio AI model to convert media into a text description 
+    for semantic product search.
+    """
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key: return "No AI Key"
+
+    # We use Gemini 2.0 Flash or GPT-4o-mini as they are excellent at multimodal
+    model = "google/gemini-2.0-flash-001"
+    
+    prompt = "Describe this product in detail for an inventory search. Focus on: item type, color, material, and style. Be concise."
+    if media_type == "audio":
+        prompt = "Transcribe this audio message. If it describes a product, list its features (color, type, etc) for search."
+
+    content_list = [{"type": "text", "text": prompt}]
+    
+    # For images, we send the URL. For audio, some models support URLs or we can use specific multimodal prompts.
+    if media_type == "image":
+        content_list.append({"type": "image_url", "image_url": {"url": media_url}})
+    else:
+        # Fallback for audio: Most multimodal models through OpenRouter prefer the URL in context if not direct
+        content_list.append({"type": "text", "text": f"\n[Media Link to analyze: {media_url}]"})
+
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key.strip()}"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": content_list}]
+                },
+                timeout=30.0
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"]
+            else:
+                print(f"❌ Multimodal Error: {resp.status_code} - {resp.text}")
+                return "Could not analyze image."
+        except Exception as e:
+            print(f"❌ Multimodal Exception: {e}")
+            return "Analysis failed."
+
+async def generate_ai_reply(user_message: str, account_id: str = None, media_url: str = None, media_type: str = None):
+    """Generate a reply using PRO-grade Vector Semantic Search and Multimodal support."""
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         return "AI Key not found."
+
+    # 0. Multimodal Pre-processing: If user sent an image/audio, convert it to a searchable description
+    actual_query = user_message
+    if media_url:
+        print(f"🖼️ [Agent] Processing {media_type} to find products...", flush=True)
+        media_description = await process_multimodal_description(media_url, media_type)
+        actual_query = f"{user_message} [User sent {media_type} described as: {media_description}]"
+        print(f"📖 [Agent] Media Description: {media_description}", flush=True)
 
     # 1. Fetch Posts and Company Info (including vectors) from DB
     posts_data = []
@@ -68,15 +120,15 @@ async def generate_ai_reply(user_message: str, account_id: str = None):
                 emb_resp = await client.post(
                     url,
                     headers=headers,
-                    json={"input": user_message, "model": model}
+                    json={"input": actual_query, "model": model}
                 )
                 if emb_resp.status_code == 200:
                     user_msg_vector = emb_resp.json()["data"][0]["embedding"]
-                    print(f"🧬 Generated Vector for user message: {user_message[:20]}...")
+                    print(f"🧬 Generated Vector for query: {actual_query[:40]}...")
                 else:
                     print(f"⚠️ Embedding API error: {emb_resp.status_code} - {emb_resp.text}")
             except Exception as e:
-                print(f"⚠️ User message embedding failed: {e}")
+                print(f"⚠️ Query embedding failed: {e}")
 
     # 3. Agentic Thought Process: Should we use Rust Search?
     final_context = ""
@@ -130,7 +182,7 @@ async def generate_ai_reply(user_message: str, account_id: str = None):
                 "model": "google/gemini-2.0-flash-001",
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
+                    {"role": "user", "content": actual_query}
                 ]
             }
             resp = await client.post(
@@ -189,13 +241,27 @@ async def unified_webhook_fastapi(platform: str, request: Request):
 
                 msg_event = messaging[0]
                 client_id = msg_event.get("sender", {}).get("id")
-                text = msg_event.get("message", {}).get("text", "")
+                message = msg_event.get("message", {})
                 
-                if text:
-                    print(f"📘 [Facebook] Message from {client_id}: {text}", flush=True)
-                    # GENERATE AI REPLY
-                    print(f"🤖 Generating AI reply using Rust context for: '{text}'...", flush=True)
-                    ai_reply = await generate_ai_reply(text, account_id)
+                text = message.get("text", "")
+                attachments = message.get("attachments", [])
+                
+                media_url = None
+                media_type = None
+                
+                if attachments:
+                    att = attachments[0]
+                    media_url = att.get("payload", {}).get("url")
+                    media_type = att.get("type") # 'image', 'audio', 'video'
+                    print(f"� [{platform}] Received {media_type}: {media_url}", flush=True)
+
+                if text or media_url:
+                    incoming_log = text if text else f"[{media_type} attachment]"
+                    print(f"📘 [{platform}] Message from {client_id}: {incoming_log}", flush=True)
+                    
+                    # GENERATE AI REPLY (Now supports multimodal)
+                    print(f"🤖 Generating AI reply for: '{incoming_log}'...", flush=True)
+                    ai_reply = await generate_ai_reply(text, account_id, media_url, media_type)
                     print(f"✨ AI REPLY: {ai_reply}", flush=True)
 
             return {"status": "received"}
