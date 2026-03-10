@@ -41,6 +41,6 @@ class PostMedia(models.Model):
     media = models.ImageField(upload_to="posts")
 
     def __str__(self):
-        return f"{self.post.post_id} - {self.post.page.account.platform}"
+        return f"{self.post.post_id} - {self.post.account.platform}"
 
 

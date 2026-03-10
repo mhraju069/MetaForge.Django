@@ -59,7 +59,7 @@ async def generate_ai_reply(user_message: str):
         except Exception as e:
             return f"Python Fallback Error: {str(e)}"
 
-@router.api_route("/{platform}/", methods=["GET", "POST"])
+@router.api_route("webhook/{platform}/", methods=["GET", "POST"])
 async def unified_webhook_fastapi(platform: str, request: Request):
     if request.method == "GET":
         token = request.query_params.get("hub.verify_token")

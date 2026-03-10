@@ -14,8 +14,8 @@ except ImportError:
     fastapi_application = None
 
 async def application(scope, receive, send):
-    if fastapi_application and scope['type'] == 'http' and scope['path'].startswith('/api/socials/webhook'):
+    # Route all /api/socials/ paths to FastAPI for high performance
+    if fastapi_application and scope['type'] == 'http' and scope['path'].startswith('/api/socials/'):
         await fastapi_application(scope, receive, send)
     else:
         await django_application(scope, receive, send)
-
