@@ -65,14 +65,17 @@ fn generate_reply(api_key: String, user_message_vector_json: String, posts: Stri
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to build client: {}", e)))?;
 
     // 1. Parse Input Data (Professional Vectorized RAG)
-    let query_vector: Vec<f32> = serde_json::from_str(&user_message_vector_json)
-        .unwrap_or_else(|_| vec![]);
+    let user_msg_json: Value = serde_json::from_str(&user_message_vector_json).unwrap_or(json!({}));
+    
+    let query_vector: Vec<f32> = user_msg_json["vector"]
+        .as_array()
+        .map(|v| v.iter().filter_map(|val| val.as_f64().map(|f| f as f32)).collect())
+        .unwrap_or_else(|| vec![]);
+
+    let user_message = user_msg_json["text"].as_str().unwrap_or("");
 
     let posts_data: Vec<Post> = serde_json::from_str(&posts)
         .unwrap_or_else(|_| vec![]);
-
-    let user_orig_msg_json: Value = serde_json::from_str(&user_message_vector_json).unwrap_or(json!(""));
-    let user_message = user_orig_msg_json["text"].as_str().unwrap_or("");
 
     // 2. High-Performance Semantic Search
     let context = find_best_semantic_context(query_vector, posts_data, 5);

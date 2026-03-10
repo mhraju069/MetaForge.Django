@@ -33,16 +33,21 @@ async def generate_ai_reply(user_message: str, account_id: str = None):
     company_info = ""
     if account_id:
         try:
-            posts_qs = await sync_to_async(lambda: list(SocialPost.objects.filter(account__account_id=account_id, vector__isnull=False).order_by("-created_at")[:200].values("post_id", "caption", "vector")))()
-            posts_data = posts_qs
-            
-            # Fetch Company context
-            account = await sync_to_async(SocialAccount.objects.get)(account_id=account_id)
-            company = account.company
-            if company.vector:
-                company_info = f"\nCompany Profile: {company.name} - {company.description} at {company.type}.\n"
+            # High-performance fetching of posts and company info in one sync block
+            def fetch_context():
+                posts = list(SocialPost.objects.filter(
+                    account__account_id=account_id, 
+                ).order_by("-created_at")[:10].values("post_id", "caption"))
+                
+                acc = SocialAccount.objects.select_related('company').get(account_id=account_id)
+                comp = acc.company
+                c_info = f"\nCompany Profile: {comp.name} - {comp.description} ({comp.type}).\n" if comp else ""
+                
+                return posts, c_info
+
+            posts_data, company_info = await sync_to_async(fetch_context)()
         except Exception as e:
-            print(f"⚠️ Context fetch error: {e}")
+            print(f"⚠️ Context fetch error: {e}", flush=True)
 
     # 2. Get Vector for current User Message (Semantic Embedding)
     user_msg_vector = []
@@ -96,8 +101,10 @@ async def generate_ai_reply(user_message: str, account_id: str = None):
         except Exception as e:
             return f"Error: {str(e)}"
 
-@router.api_route("webhook/{platform}/", methods=["GET", "POST"])
+@router.api_route("/{platform}/", methods=["GET", "POST"])
 async def unified_webhook_fastapi(platform: str, request: Request):
+    print(f"📡 [FastAPI] Incoming request for platform: {platform}", flush=True)
+    
     if request.method == "GET":
         token = request.query_params.get("hub.verify_token")
         challenge = request.query_params.get("hub.challenge")
@@ -108,11 +115,13 @@ async def unified_webhook_fastapi(platform: str, request: Request):
     if request.method == "POST":
         try:
             data = await request.json()
-            print(f"🚀 [{platform}] FastAPI Webhook JSON: {json.dumps(data)}")
+            print(f"🚀 [{platform}] FastAPI Webhook JSON: {json.dumps(data)}", flush=True)
 
             if platform == "fb":
                 entry = data.get("entry", [])
-                if not entry: return {"status": "no_entry"}
+                if not entry: 
+                    print("⚠️ No entry found in Facebook webhook", flush=True)
+                    return {"status": "no_entry"}
 
                 entry0 = entry[0]
                 account_id = entry0.get("id")
@@ -120,34 +129,35 @@ async def unified_webhook_fastapi(platform: str, request: Request):
                 # Call Django ORM async
                 account = await sync_check_account("fb", account_id)
                 if not account:
-                    print(f"❌ [Facebook] No active profile found for {account_id}")
+                    print(f"❌ [Facebook] No active profile found for {account_id}", flush=True)
                     return {"status": "no_profile"}
                 
-                print(f"✅ [Facebook] Account found: {account.name or account.account_id}")
+                print(f"✅ [Facebook] Account found: {account.name or account.account_id}", flush=True)
 
                 messaging = entry0.get("messaging", [])
-                if not messaging: return {"status": "no_messaging"}
+                if not messaging: 
+                    print("⚠️ No messaging events found", flush=True)
+                    return {"status": "no_messaging"}
 
                 msg_event = messaging[0]
                 client_id = msg_event.get("sender", {}).get("id")
                 text = msg_event.get("message", {}).get("text", "")
                 
                 if text:
-                    print(f"📘 [Facebook] Message from {client_id}: {text}")
+                    print(f"📘 [Facebook] Message from {client_id}: {text}", flush=True)
                     # GENERATE AI REPLY
-                    print(f"🤖 Generating AI reply for: '{text}'...")
+                    print(f"🤖 Generating AI reply using Rust context for: '{text}'...", flush=True)
                     ai_reply = await generate_ai_reply(text, account_id)
-                    print(f"✨ AI REPLY: {ai_reply}")
+                    print(f"✨ AI REPLY: {ai_reply}", flush=True)
 
             return {"status": "received"}
 
         except Exception as e:
-            print(f"❌ CRITICAL WEBHOOK ERROR ({platform}): {str(e)}")
+            print(f"❌ CRITICAL WEBHOOK ERROR ({platform}): {str(e)}", flush=True)
             return {"status": "error", "message": str(e)}
 
-# Keep Django version for compatibility if needed, but point it to FastAPI or just leave it
+# Keep Django version for debugging
 @csrf_exempt
 def unified_webhook(request, platform):
-    # This is the old Django view. 
-    # You can redirect or keep it. For now, let's keep it as a fallback or remove it.
-    return JsonResponse({"message": "Use the FastAPI endpoint at /api/socials/webhook/{platform}/"})
+    print(f"⚠️ [Django Fallback] Webhook hit the Django view instead of FastAPI! Platform: {platform}", flush=True)
+    return JsonResponse({"message": "This request was handled by Django. Please check ASGI config to route to FastAPI."})

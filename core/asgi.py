@@ -16,6 +16,7 @@ except ImportError:
 async def application(scope, receive, send):
     # Route all /api/socials/ paths to FastAPI for high performance
     if fastapi_application and scope['type'] == 'http' and scope['path'].startswith('/api/socials/'):
+        print(f"⚡ [ASGI] Routing to FastAPI: {scope['path']}", flush=True)
         await fastapi_application(scope, receive, send)
     else:
         await django_application(scope, receive, send)
