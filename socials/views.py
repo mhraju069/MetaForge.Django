@@ -117,47 +117,63 @@ async def sync_facebook_all_posts(account):
         
         resp = await client.get(fb_url, params=params)
         data = resp.json()
+        print(f"🚀 [Facebook API Response Data]: {json.dumps(data, indent=2)}")
         
         if "data" not in data:
             return {"error": "FB API Error", "details": data}
         
+        fetched_count = 0
         for item in data["data"]:
             post_id = item.get("id")
             caption = item.get("message", "") # FB calls it message
+            print(f"📝 Saving FB Post: {post_id} | Caption: {caption[:50]}...")
 
             # 1. Update/Create post
-            post, _ = await sync_to_async(SocialPost.objects.update_or_create)(
+            post, created = await sync_to_async(SocialPost.objects.update_or_create)(
                 account=account,
                 post_id=post_id,
                 defaults={"caption": caption}
             )
+            print(f"✅ Post {'Created' if created else 'Updated'}: {post_id}")
 
             # 2. Media Handling
             media_urls = set()
-            if item.get("full_picture"):
-                media_urls.add(item["full_picture"])
             
-            # Check attachments for more images/carousels
+            # Check attachments for images/carousels (Prioritize attachments)
             attachments = item.get("attachments", {}).get("data", [])
-            for att in attachments:
-                # If it's a carousel (album)
-                sub = att.get("subattachments", {}).get("data", [])
-                for s in sub:
-                    src = s.get("media", {}).get("image", {}).get("src")
-                    if src: media_urls.add(src)
-                
-                # If it's a single image/video that's not in full_picture
-                src = att.get("media", {}).get("image", {}).get("src")
-                if src: media_urls.add(src)
+            if attachments:
+                for att in attachments:
+                    # If it's a carousel (album), it has subattachments
+                    sub = att.get("subattachments", {}).get("data", [])
+                    if sub:
+                        print(f"📦 Found Carousel (Album) with {len(sub)} items")
+                        for s in sub:
+                            src = s.get("media", {}).get("image", {}).get("src")
+                            if src: media_urls.add(src)
+                    else:
+                        # Single image/video attachment
+                        src = att.get("media", {}).get("image", {}).get("src")
+                        if src: media_urls.add(src)
+            
+            # If no attachments found, fallback to full_picture
+            if not media_urls and item.get("full_picture"):
+                media_urls.add(item["full_picture"])
 
             # 3. Save media links
+            media_count = 0
             for m_url in media_urls:
-                await sync_to_async(PostMedia.objects.get_or_create)(
+                _, m_created = await sync_to_async(PostMedia.objects.get_or_create)(
                     post=post,
                     media_url=m_url
                 )
+                if m_created: media_count += 1
+            
+            if media_count > 0:
+                print(f"🖼️ Saved {media_count} new media items for post {post_id}")
 
-        return {"status": "success", "count": len(data["data"])}
+            fetched_count += 1
+
+        return {"status": "success", "count": fetched_count}
 
 
 async def sync_instagram_all_posts(account):
@@ -173,37 +189,51 @@ async def sync_instagram_all_posts(account):
         
         resp = await client.get(url, params=params)
         data = resp.json()
+        print(f"📸 [Instagram API Response Data]: {json.dumps(data, indent=2)}")
         
         if "data" not in data:
             return {"error": "IG API Error", "details": data}
         
+        fetched_count = 0
         for item in data["data"]:
             post_id = item.get("id")
             caption = item.get("caption", "")
+            print(f"📝 Saving IG Post: {post_id} | Caption: {caption[:50]}...")
 
-            post, _ = await sync_to_async(SocialPost.objects.update_or_create)(
+            post, created = await sync_to_async(SocialPost.objects.update_or_create)(
                 account=account,
                 post_id=post_id,
                 defaults={"caption": caption}
             )
+            print(f"✅ Post {'Created' if created else 'Updated'}: {post_id}")
 
             # Media Handling
             media_urls = set()
-            if item.get("media_url"):
-                media_urls.add(item["media_url"])
             
-            # For carousels
+            # For carousels (Prioritize children)
             children = item.get("children", {}).get("data", [])
-            for child in children:
-                if child.get("media_url"): media_urls.add(child["media_url"])
+            if children:
+                print(f"📦 Found Instagram Carousel with {len(children)} items")
+                for child in children:
+                    if child.get("media_url"): media_urls.add(child["media_url"])
+            elif item.get("media_url"):
+                # Single photo/video
+                media_urls.add(item["media_url"])
                 
+            media_count = 0
             for m_url in media_urls:
-                await sync_to_async(PostMedia.objects.get_or_create)(
+                _, m_created = await sync_to_async(PostMedia.objects.get_or_create)(
                     post=post,
                     media_url=m_url
                 )
+                if m_created: media_count += 1
+            
+            if media_count > 0:
+                print(f"🖼️ Saved {media_count} new media items for post {post_id}")
 
-        return {"status": "success", "count": len(data["data"])}
+            fetched_count += 1
+
+        return {"status": "success", "count": fetched_count}
 
 
 @router.get("/connect/fb/")
