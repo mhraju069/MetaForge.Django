@@ -1,3 +1,4 @@
+import os
 from fastapi import APIRouter, Request, Response
 from asgiref.sync import sync_to_async
 from django.http import HttpResponse, JsonResponse
@@ -5,14 +6,58 @@ from django.views.decorators.csrf import csrf_exempt
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.utils import timezone
-import json, requests
+import json, requests, httpx
+import anyio
 from .models import *
 from .helper import *
+
+# Bridge to Rust
+try:
+    import rust_ai
+except ImportError:
+    rust_ai = None
 
 router = APIRouter()
 
 # Helper to run Django ORM in async
 sync_check_account = sync_to_async(check_account)
+
+async def generate_ai_reply(user_message: str):
+    """Generate a reply using Rust-accelerated AI bridge."""
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        return "AI Key not found."
+    
+    if rust_ai:
+        try:
+            # Run the synchronous Rust function in a separate thread to keep FastAPI fast
+            return await anyio.to_thread.run_sync(rust_ai.generate_reply, api_key, user_message)
+        except Exception as e:
+            print(f"❌ Rust AI Error: {e}")
+            return f"Rust Error: {str(e)}"
+    
+    # Fallback to Python if Rust is not available
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "google/gemini-2.0-flash-001",
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant for MetaForge."},
+                        {"role": "user", "content": user_message}
+                    ],
+                },
+                timeout=30.0
+            )
+            res_data = response.json()
+            return res_data['choices'][0]['message']['content']
+        except Exception as e:
+            return f"Python Fallback Error: {str(e)}"
 
 @router.api_route("/{platform}/", methods=["GET", "POST"])
 async def unified_webhook_fastapi(platform: str, request: Request):
@@ -49,7 +94,13 @@ async def unified_webhook_fastapi(platform: str, request: Request):
                 msg_event = messaging[0]
                 client_id = msg_event.get("sender", {}).get("id")
                 text = msg_event.get("message", {}).get("text", "")
-                print(f"📘 [Facebook] Message from {client_id}: {text}")
+                
+                if text:
+                    print(f"📘 [Facebook] Message from {client_id}: {text}")
+                    # GENERATE AI REPLY
+                    print(f"🤖 Generating AI reply for: '{text}'...")
+                    ai_reply = await generate_ai_reply(text)
+                    print(f"✨ AI REPLY: {ai_reply}")
 
             return {"status": "received"}
 
