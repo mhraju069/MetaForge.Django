@@ -107,6 +107,7 @@ class Company(models.Model):
     type = models.CharField(max_length=200,verbose_name="Company Type",blank=True, null=True)
     description = models.TextField(blank=True, null=True,verbose_name="Company Description")
     address = models.TextField(blank=True, null=True,verbose_name="Company Address")
+    vector = models.JSONField(null=True, blank=True)
     employees = models.ManyToManyField(User, related_name='company_employees', blank=True)
     
     def __str__(self):

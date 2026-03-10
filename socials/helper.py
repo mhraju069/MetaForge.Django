@@ -1,4 +1,5 @@
 import requests
+import os
 from django.conf import settings
 from .models import *
 
@@ -29,4 +30,37 @@ def chec_subscription(company):
 
 def check_account(platform,account_id):
     return SocialAccount.objects.filter(platform=platform,account_id=account_id).first()
-    
+
+
+def train_post_embedding(post):
+    """
+    Generate semantic embedding for a single post using a Pro setup (Sync).
+    Called automatically via signals when a post is saved.
+    """
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        print("⚠️ Training skipped: OPENROUTER_API_KEY not found.")
+        return
+
+    try:
+        # Use OpenAI-compatible embedding model endpoint
+        # Replace with your preferred embedding provider URL if necessary
+        url = "https://api.openai.com/v1/embeddings"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        payload = {
+            "input": post.caption,
+            "model": "text-embedding-3-small"
+        }
+        
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        
+        if resp.status_code == 200:
+            vector = resp.json()["data"][0]["embedding"]
+            # Update post without triggering the signal infinite loop
+            SocialPost.objects.filter(id=post.id).update(vector=vector)
+            print(f"✨ Successfully trained post {post.post_id}")
+        else:
+            print(f"⚠️ Embedding API error: {resp.text}")
+            
+    except Exception as e:
+        print(f"❌ Exception in training post {post.post_id}: {e}")

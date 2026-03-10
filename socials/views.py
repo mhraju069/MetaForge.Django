@@ -67,6 +67,9 @@ async def fetch_posts(account_id: str, request: Request):
     return {"error": "Platform not supported for fetching posts"}
 
 
+    return {"error": "Platform not supported for fetching posts"}
+
+
 async def sync_facebook_all_posts(account):
     """Sync all posts from a Facebook Page."""
     async with httpx.AsyncClient() as client:
@@ -254,12 +257,20 @@ async def facebook_callback(request: Request, code: str = None, error: str = Non
             page_token = page.get("access_token")
 
             if page_id and page_token:
-                await sync_update_or_create_social(
+                account, _ = await sync_update_or_create_social(
                     account_id=page_id,
                     platform="fb",
                     defaults={"company": company, "name": page_name, "token": page_token}
                 )
                 await sync_to_async(subscribe_page_to_webhook)(page_id, page_token, page_name)
+                
+                # --- AUTO-FETCH POSTS AFTER SUCCESSFUL CONNECTION ---
+                try:
+                    await sync_facebook_all_posts(account)
+                    print(f"🎯 Auto-fetched posts for FB Page: {page_name}")
+                except Exception as e:
+                    print(f"⚠️ Error auto-fetching FB posts: {e}")
+                
                 break # Only first page for now as per original code
 
     if _from == "app":
@@ -341,7 +352,7 @@ async def instagram_callback(request: Request, code: str = None, error: str = No
         username = me_data.get("username", "Instagram Business")
 
         company = await sync_get_company_by_id(company_id)
-        await sync_update_or_create_social(
+        account, _ = await sync_update_or_create_social(
             platform='ig',
             company=company,
             defaults={"account_id": final_ig_id, "name": username, "token": long_lived_token}
@@ -352,6 +363,13 @@ async def instagram_callback(request: Request, code: str = None, error: str = No
             "subscribed_fields": "messages,messaging_postbacks,messaging_seen",
             "access_token": long_lived_token
         })
+
+        # --- AUTO-FETCH POSTS AFTER SUCCESSFUL CONNECTION ---
+        try:
+            await sync_instagram_all_posts(account)
+            print(f"🎯 Auto-fetched posts for Instagram: {username}")
+        except Exception as e:
+            print(f"⚠️ Error auto-fetching IG posts: {e}")
 
     if _from == "app":
         return {"status": "success"}
@@ -377,7 +395,4 @@ class InstagramConnectView(APIView):
 
 class InstagramCallbackView(APIView):
     def get(self, request): return DRFResponse({"message": "FastAPI handled"})
-
-class FetchPostsView(APIView):
-    def get(self, request, account_id): return DRFResponse({"message": "FastAPI handled"})
 

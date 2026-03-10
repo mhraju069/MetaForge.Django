@@ -23,56 +23,76 @@ router = APIRouter()
 sync_check_account = sync_to_async(check_account)
 
 async def generate_ai_reply(user_message: str, account_id: str = None):
-    """Generate a reply using Rust-accelerated AI bridge, with post context."""
+    """Generate a reply using PRO-grade Vector Semantic Search."""
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         return "AI Key not found."
-    
-    # 1. Fetch Context from DB
-    context = ""
+
+    # 1. Fetch Posts and Company Info (including vectors) from DB
+    posts_data = []
+    company_info = ""
     if account_id:
         try:
-            # Get latest 5 posts for this account to give AI awareness of products/posts
-            posts = await sync_to_async(lambda: list(SocialPost.objects.filter(account__account_id=account_id).order_by("-created_at")[:5]))()
-            if posts:
-                context = "\nRecent Posts/Products Context:\n"
-                for p in posts:
-                    context += f"- Post ID: {p.post_id}, Caption: {p.caption}\n"
+            posts_qs = await sync_to_async(lambda: list(SocialPost.objects.filter(account__account_id=account_id, vector__isnull=False).order_by("-created_at")[:200].values("post_id", "caption", "vector")))()
+            posts_data = posts_qs
+            
+            # Fetch Company context
+            account = await sync_to_async(SocialAccount.objects.get)(account_id=account_id)
+            company = account.company
+            if company.vector:
+                company_info = f"\nCompany Profile: {company.name} - {company.description} at {company.type}.\n"
         except Exception as e:
             print(f"⚠️ Context fetch error: {e}")
 
-    system_prompt = "You are a helpful assistant for MetaForge. "
-    if context:
-        system_prompt += f"Use the following recent post data to help users with their questions:\n{context}"
-    
-    if rust_ai:
+    # 2. Get Vector for current User Message (Semantic Embedding)
+    user_msg_vector = []
+    if posts_data:
+        async with httpx.AsyncClient() as client:
+            try:
+                emb_resp = await client.post(
+                    "https://api.openai.com/v1/embeddings",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json={"input": user_message, "model": "text-embedding-3-small"}
+                )
+                if emb_resp.status_code == 200:
+                    user_msg_vector = emb_resp.json()["data"][0]["embedding"]
+            except Exception as e:
+                print(f"⚠️ User message embedding failed: {e}")
+
+    # 3. Utilize High-Performance Rust Semantic Search
+    if rust_ai and user_msg_vector:
         try:
-            # We skip context for Rust AI for now unless rust_ai supports it
-            return await anyio.to_thread.run_sync(rust_ai.generate_reply, api_key, user_message)
+            # Struct our query with its vector and original text
+            query_ctx = {"text": user_message, "vector": user_msg_vector}
+            posts_json = json.dumps(posts_data)
+            return await anyio.to_thread.run_sync(rust_ai.generate_reply, api_key, json.dumps(query_ctx), posts_json)
         except Exception as e:
-            print(f"❌ Rust AI Error: {e}")
-            return f"Rust Error: {str(e)}"
+            print(f"❌ Rust Vector Search Error: {e}")
+
+    # 4. Fallback if Rust or Vectors are missing
+    context = ""
+    if posts_data:
+        context = "\nRecent Posts Context:\n" + "\n".join([f"- {p['caption']}" for p in posts_data[:3]])
+
+    system_prompt = "You are a professional shop assistant for MetaForge. Provide helpful and relevant replies. "
+    if company_info:
+        system_prompt += f"Background Shop Info: {company_info}"
     
-    # Fallback to Python if Rust is not available
+    if context:
+        system_prompt += f" Use this specific product/post context: \n{context}"
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
                 url="https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers={"Authorization": f"Bearer {api_key}"},
                 json={
                     "model": "google/gemini-2.0-flash-001",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message}
-                    ],
+                    "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}],
                 },
                 timeout=30.0
             )
-            res_data = response.json()
-            return res_data['choices'][0]['message']['content']
+            return response.json()['choices'][0]['message']['content']
         except Exception as e:
             return f"Error: {str(e)}"
 

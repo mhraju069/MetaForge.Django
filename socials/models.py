@@ -29,6 +29,7 @@ class SocialPost(models.Model):
     account = models.ForeignKey(SocialAccount,related_name="posts",on_delete=models.CASCADE)
     post_id = models.CharField(max_length=200)
     caption = models.TextField()
+    vector = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
