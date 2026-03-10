@@ -67,6 +67,42 @@ async def get_authenticated_user(request: Request):
 
     return None
 
+async def generate_vector(text: str):
+    """Generate vector for a given text using OpenAI or OpenRouter."""
+    if not text or not text.strip():
+        return None
+    
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
+    
+    if (not api_key or not api_key.strip()) and (not openai_key or not openai_key.strip()):
+        return None
+
+    async with httpx.AsyncClient() as client:
+        try:
+            if openai_key and openai_key.strip():
+                url = "https://api.openai.com/v1/embeddings"
+                headers = {"Authorization": f"Bearer {openai_key.strip()}"}
+                model = "text-embedding-3-small"
+            else:
+                url = "https://openrouter.ai/api/v1/embeddings"
+                headers = {"Authorization": f"Bearer {api_key.strip()}"}
+                model = "openai/text-embedding-3-small"
+
+            resp = await client.post(
+                url, 
+                headers=headers, 
+                json={"input": text, "model": model},
+                timeout=10.0
+            )
+            if resp.status_code == 200:
+                return resp.json()["data"][0]["embedding"]
+            else:
+                print(f"⚠️ Embedding fetch failed: {resp.status_code} - {resp.text}")
+        except Exception as e:
+            print(f"⚠️ Vector generation error: {e}")
+    return None
+
 # --- FastAPI Routes ---
 
 @router.get("/account/")
@@ -128,11 +164,16 @@ async def sync_facebook_all_posts(account):
             caption = item.get("message", "") # FB calls it message
             print(f"📝 Saving FB Post: {post_id} | Caption: {caption[:50]}...")
 
+            # --- GENERATE VECTOR ---
+            vector = await generate_vector(caption)
+            if vector:
+                print(f"🧬 Generated Vector for FB Post: {post_id}")
+
             # 1. Update/Create post
             post, created = await sync_to_async(SocialPost.objects.update_or_create)(
                 account=account,
                 post_id=post_id,
-                defaults={"caption": caption}
+                defaults={"caption": caption, "vector": vector}
             )
             print(f"✅ Post {'Created' if created else 'Updated'}: {post_id}")
 
@@ -200,10 +241,15 @@ async def sync_instagram_all_posts(account):
             caption = item.get("caption", "")
             print(f"📝 Saving IG Post: {post_id} | Caption: {caption[:50]}...")
 
+            # --- GENERATE VECTOR ---
+            vector = await generate_vector(caption)
+            if vector:
+                print(f"🧬 Generated Vector for IG Post: {post_id}")
+
             post, created = await sync_to_async(SocialPost.objects.update_or_create)(
                 account=account,
                 post_id=post_id,
-                defaults={"caption": caption}
+                defaults={"caption": caption, "vector": vector}
             )
             print(f"✅ Post {'Created' if created else 'Updated'}: {post_id}")
 

@@ -37,7 +37,7 @@ async def generate_ai_reply(user_message: str, account_id: str = None):
             def fetch_context():
                 posts = list(SocialPost.objects.filter(
                     account__account_id=account_id, 
-                ).order_by("-created_at")[:10].values("post_id", "caption"))
+                ).order_by("-created_at")[:20].values("post_id", "caption", "vector"))
                 
                 acc = SocialAccount.objects.select_related('company').get(account_id=account_id)
                 comp = acc.company
@@ -52,54 +52,102 @@ async def generate_ai_reply(user_message: str, account_id: str = None):
     # 2. Get Vector for current User Message (Semantic Embedding)
     user_msg_vector = []
     if posts_data:
+        openai_key = os.getenv("OPENAI_API_KEY")
         async with httpx.AsyncClient() as client:
             try:
+                # Use OpenAI if key provided (direct), otherwise use OpenRouter's embedding model
+                if openai_key and openai_key.strip():
+                    url = "https://api.openai.com/v1/embeddings"
+                    headers = {"Authorization": f"Bearer {openai_key.strip()}"}
+                    model = "text-embedding-3-small"
+                else:
+                    url = "https://openrouter.ai/api/v1/embeddings"
+                    headers = {"Authorization": f"Bearer {api_key.strip()}"}
+                    model = "openai/text-embedding-3-small"
+
                 emb_resp = await client.post(
-                    "https://api.openai.com/v1/embeddings",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json={"input": user_message, "model": "text-embedding-3-small"}
+                    url,
+                    headers=headers,
+                    json={"input": user_message, "model": model}
                 )
                 if emb_resp.status_code == 200:
                     user_msg_vector = emb_resp.json()["data"][0]["embedding"]
+                    print(f"🧬 Generated Vector for user message: {user_message[:20]}...")
+                else:
+                    print(f"⚠️ Embedding API error: {emb_resp.status_code} - {emb_resp.text}")
             except Exception as e:
                 print(f"⚠️ User message embedding failed: {e}")
 
-    # 3. Utilize High-Performance Rust Semantic Search
+    # 3. Agentic Thought Process: Should we use Rust Search?
+    final_context = ""
     if rust_ai and user_msg_vector:
         try:
-            # Struct our query with its vector and original text
-            query_ctx = {"text": user_message, "vector": user_msg_vector}
+            print("🤖 [Agent] Searching through shop posts via Rust Search Engine...")
+            # Use our new Rust search tool
+            vector_str = json.dumps(user_msg_vector)
             posts_json = json.dumps(posts_data)
-            return await anyio.to_thread.run_sync(rust_ai.generate_reply, api_key, json.dumps(query_ctx), posts_json)
+            limit = 10
+            
+            # The tool call (Agentic Search)
+            search_results = await anyio.to_thread.run_sync(rust_ai.search_context, vector_str, posts_json, limit)
+            
+            if search_results and search_results.strip():
+                print(f"✅ [Agent] Relevant product context found by search engine.")
+                final_context = search_results
+            else:
+                print(f"⚠️ [Agent] No semantically relevant products found for query. Using direct history.")
         except Exception as e:
-            print(f"❌ Rust Vector Search Error: {e}")
+            print(f"❌ [Agent] Search Tool Error: {e}")
 
-    # 4. Fallback if Rust or Vectors are missing
-    context = ""
-    if posts_data:
-        context = "\nRecent Posts Context:\n" + "\n".join([f"- {p['caption']}" for p in posts_data[:3]])
+    # 4. Fallback Context (Agentic Backup)
+    if not final_context and posts_data:
+        # If vector search finds nothing, we still look at latest posts as context
+        final_context = "\nRecent Posts (Direct): " + "\n".join([f"- {p['caption']}" for p in posts_data[:10]])
 
-    system_prompt = "You are a professional shop assistant for MetaForge. Provide helpful and relevant replies. "
+    # 5. Core System Prompt (The Agent's instructions)
+    system_prompt = (
+        "You are an AI Shop Assistant for MetaForge. Talk naturally like a real person. "
+        "Your only job is to provide product information from the 'Shop Context' below. "
+        "\n\nSTRICT RULES:\n"
+        "1. ONLY use data from the 'Shop Context'. If a product or price is not there, say you cannot find it.\n"
+        "2. Do NOT invent prices, currencies, or details (like ratings or fake websites).\n"
+        "3. NEVER output JSON, code blocks, or special formatted lists. Talk as if you are in a chat.\n"
+        "4. Use the specific currency (e.g., BDT) shown in the context.\n"
+        "5. If you see a price like '1,630.00 BDT', use exactly that."
+    )
     if company_info:
-        system_prompt += f"Background Shop Info: {company_info}"
+        system_prompt += f"\n\nShop Background: {company_info}"
     
-    if context:
-        system_prompt += f" Use this specific product/post context: \n{context}"
+    if final_context:
+        system_prompt += f"\n\nShop Context:\n{final_context}"
 
+    print(f"✉️ [Agent] Sending query to AI Model with {len(final_context)} chars of context...")
+
+    # 6. Call LLM for final delivery
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(
-                url="https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": "google/gemini-2.0-flash-001",
-                    "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}],
-                },
-                timeout=30.0
+            payload = {
+                "model": "google/gemini-2.0-flash-001",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ]
+            }
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key.strip()}"},
+                json=payload,
+                timeout=25.0
             )
-            return response.json()['choices'][0]['message']['content']
+            if resp.status_code == 200:
+                answer = resp.json()["choices"][0]["message"]["content"]
+                return answer
+            else:
+                print(f"❌ LLM error: {resp.status_code} - {resp.text}")
+                return "I'm sorry, I'm having trouble retrieving details right now."
         except Exception as e:
-            return f"Error: {str(e)}"
+            print(f"❌ AI delivery error: {e}")
+            return "I'm having trouble connecting to my brain right now."
 
 @router.api_route("/{platform}/", methods=["GET", "POST"])
 async def unified_webhook_fastapi(platform: str, request: Request):
