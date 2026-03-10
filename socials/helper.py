@@ -1,5 +1,6 @@
 import requests
 from django.conf import settings
+from .models import *
 
 def subscribe_page_to_webhook(page_id, page_access_token,page_name):
     """Subscribe a Facebook Page to receive webhook events."""
@@ -20,3 +21,12 @@ def subscribe_page_to_webhook(page_id, page_access_token,page_name):
     except Exception as e:
         print(f"❌ Exception while subscribing Facebook Page {page_name}: {e}")
         return False
+
+
+def chec_subscription(company):
+    pass
+
+
+def check_account(platform,account_id):
+    return SocialAccount.objects.filter(platform=platform,account_id=account_id).first()
+    
