@@ -38,7 +38,9 @@ class SocialPost(models.Model):
 
 class PostMedia(models.Model):
     post = models.ForeignKey(SocialPost,related_name="media",on_delete=models.CASCADE)
-    media = models.ImageField(upload_to="posts")
+    media = models.ImageField(upload_to="posts", null=True, blank=True)
+    media_url = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return f"{self.post.post_id} - {self.post.account.platform}"

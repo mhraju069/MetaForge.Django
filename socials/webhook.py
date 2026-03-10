@@ -22,15 +22,32 @@ router = APIRouter()
 # Helper to run Django ORM in async
 sync_check_account = sync_to_async(check_account)
 
-async def generate_ai_reply(user_message: str):
-    """Generate a reply using Rust-accelerated AI bridge."""
+async def generate_ai_reply(user_message: str, account_id: str = None):
+    """Generate a reply using Rust-accelerated AI bridge, with post context."""
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         return "AI Key not found."
     
+    # 1. Fetch Context from DB
+    context = ""
+    if account_id:
+        try:
+            # Get latest 5 posts for this account to give AI awareness of products/posts
+            posts = await sync_to_async(lambda: list(SocialPost.objects.filter(account__account_id=account_id).order_by("-created_at")[:5]))()
+            if posts:
+                context = "\nRecent Posts/Products Context:\n"
+                for p in posts:
+                    context += f"- Post ID: {p.post_id}, Caption: {p.caption}\n"
+        except Exception as e:
+            print(f"⚠️ Context fetch error: {e}")
+
+    system_prompt = "You are a helpful assistant for MetaForge. "
+    if context:
+        system_prompt += f"Use the following recent post data to help users with their questions:\n{context}"
+    
     if rust_ai:
         try:
-            # Run the synchronous Rust function in a separate thread to keep FastAPI fast
+            # We skip context for Rust AI for now unless rust_ai supports it
             return await anyio.to_thread.run_sync(rust_ai.generate_reply, api_key, user_message)
         except Exception as e:
             print(f"❌ Rust AI Error: {e}")
@@ -48,7 +65,7 @@ async def generate_ai_reply(user_message: str):
                 json={
                     "model": "google/gemini-2.0-flash-001",
                     "messages": [
-                        {"role": "system", "content": "You are a helpful assistant for MetaForge."},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message}
                     ],
                 },
@@ -57,7 +74,7 @@ async def generate_ai_reply(user_message: str):
             res_data = response.json()
             return res_data['choices'][0]['message']['content']
         except Exception as e:
-            return f"Python Fallback Error: {str(e)}"
+            return f"Error: {str(e)}"
 
 @router.api_route("webhook/{platform}/", methods=["GET", "POST"])
 async def unified_webhook_fastapi(platform: str, request: Request):
@@ -99,7 +116,7 @@ async def unified_webhook_fastapi(platform: str, request: Request):
                     print(f"📘 [Facebook] Message from {client_id}: {text}")
                     # GENERATE AI REPLY
                     print(f"🤖 Generating AI reply for: '{text}'...")
-                    ai_reply = await generate_ai_reply(text)
+                    ai_reply = await generate_ai_reply(text, account_id)
                     print(f"✨ AI REPLY: {ai_reply}")
 
             return {"status": "received"}

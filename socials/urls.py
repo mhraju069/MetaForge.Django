@@ -9,4 +9,5 @@ urlpatterns = [
     path('callback/fb/', FacebookCallbackView.as_view(), name='facebook_callback'),
     path('connect/ig/', InstagramConnectView.as_view(), name='instagram_connect'),
     path('callback/ig/', InstagramCallbackView.as_view(), name='instagram_callback'),
+    path('fetch-posts/<str:account_id>/', FetchPostsView.as_view(), name='fetch_posts'),
 ]
