@@ -13,6 +13,7 @@ from .helper import subscribe_page_to_webhook, check_account
 from accounts.helper import get_company
 from accounts.models import Company
 from core.utils import encrypt_data, decrypt_data
+from rest_framework_simplejwt.authentication import JWTAuthentication
 
 # Bridge to Rust
 try:
@@ -29,16 +30,49 @@ sync_get_company_by_id = sync_to_async(lambda id: Company.objects.get(id=id))
 sync_update_or_create_social = sync_to_async(SocialAccount.objects.update_or_create)
 sync_check_account = sync_to_async(check_account)
 
+# --- Authentication Helper ---
+async def get_authenticated_user(request: Request):
+    """
+    Unified user authentication for FastAPI.
+    Checks request.state, request.scope, and manual JWT header.
+    """
+    # 1. Check if already attached (middleware)
+    user = getattr(request.state, "user", None)
+    if user and user.is_authenticated:
+        return user
+    
+    # 2. Check ASGI scope (Django)
+    scope_user = request.scope.get("user")
+    if scope_user:
+        if callable(scope_user):
+            user = await sync_to_async(scope_user)()
+        else:
+            user = scope_user
+        if user and user.is_authenticated:
+            return user
+
+    # 3. Manual JWT check (Compatible with SimpleJWT)
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        try:
+            token = auth_header.split(" ")[1]
+            jwt_auth = JWTAuthentication()
+            validated_token = await sync_to_async(jwt_auth.get_validated_token)(token)
+            user = await sync_to_async(jwt_auth.get_user)(validated_token)
+            if user and user.is_active:
+                return user
+        except Exception as e:
+            # print(f"Auth error: {e}")
+            pass
+
+    return None
+
 # --- FastAPI Routes ---
 
 @router.get("/account/")
 async def get_social_accounts(request: Request):
-    # Note: In a real FastAPI app, we'd use a dependency for JWT auth.
-    # For now, we assume the user is accessible via Django session if available
-    # or we might need to implement JWT validation here.
-    # Since this is a migration, I'll use a placeholder for auth or try to get it from request.
-    user = getattr(request.state, "user", None) or await sync_to_async(lambda: request.scope.get("user"))()
-    if not user or not user.is_authenticated:
+    user = await get_authenticated_user(request)
+    if not user:
         return {"error": "Not authenticated"}
     
     company = await sync_get_company(user)
@@ -48,8 +82,8 @@ async def get_social_accounts(request: Request):
 
 @router.get("/fetch-posts/{account_id}/")
 async def fetch_posts(account_id: str, request: Request):
-    user = getattr(request.state, "user", None) or await sync_to_async(lambda: request.scope.get("user"))()
-    if not user or not user.is_authenticated:
+    user = await get_authenticated_user(request)
+    if not user:
         return {"error": "Not authenticated"}
 
     company = await sync_get_company(user)
@@ -174,8 +208,8 @@ async def sync_instagram_all_posts(account):
 
 @router.get("/connect/fb/")
 async def facebook_connect(request: Request, _from: str = "web"):
-    user = getattr(request.state, "user", None) or await sync_to_async(lambda: request.scope.get("user"))()
-    if not user or not user.is_authenticated:
+    user = await get_authenticated_user(request)
+    if not user:
          return {"error": "Not authenticated"}
 
     company = await sync_get_company(user)
@@ -280,8 +314,8 @@ async def facebook_callback(request: Request, code: str = None, error: str = Non
 
 @router.get("/connect/ig/")
 async def instagram_connect(request: Request, _from: str = "web"):
-    user = getattr(request.state, "user", None) or await sync_to_async(lambda: request.scope.get("user"))()
-    if not user or not user.is_authenticated:
+    user = await get_authenticated_user(request)
+    if not user:
          return {"error": "Not authenticated"}
 
     company = await sync_get_company(user)
