@@ -1,25 +1,21 @@
 import os
 import django
 from django.core.asgi import get_asgi_application
-from channels.routing import ProtocolTypeRouter, URLRouter
-from channels.auth import AuthMiddlewareStack
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings')
 django.setup()
 
-application = get_asgi_application()
+django_application = get_asgi_application()
 
+# Import FastAPI app
+try:
+    from fastapi_app import app as fastapi_application
+except ImportError:
+    fastapi_application = None
 
-# import messaging.routing
-
-# websocket_urlpatterns = messaging.routing.websocket_urlpatterns 
-
-# application = ProtocolTypeRouter({
-#     "http": get_asgi_application(),
-#     "websocket": AuthMiddlewareStack(
-#         URLRouter(
-#             websocket_urlpatterns
-#         )
-#     ),
-# })
+async def application(scope, receive, send):
+    if fastapi_application and scope['type'] == 'http' and scope['path'].startswith('/api/socials/webhook'):
+        await fastapi_application(scope, receive, send)
+    else:
+        await django_application(scope, receive, send)
 
