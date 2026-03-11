@@ -10,6 +10,7 @@ import json, requests, httpx
 import anyio
 from .models import *
 from .helper import *
+from .image_search import compute_phash_from_url, find_best_visual_match
 
 # Bridge to Rust
 try:
@@ -19,8 +20,51 @@ except ImportError:
 
 router = APIRouter()
 
+# Global cache to prevent double processing of same mid (message id)
+# In production, use Redis. For now, a memory set works.
+PROCESSED_MIDS = set()
+
 # Helper to run Django ORM in async
 sync_check_account = sync_to_async(check_account)
+
+async def send_facebook_message(recipient_id: str, message_text: str, images: list = None, access_token: str = ""):
+    """Sends a text message and optional image attachments to a Facebook user."""
+    if not access_token:
+        print("❌ Cannot send message: No access token provided.")
+        return
+
+    fb_url = f"https://graph.facebook.com/v20.0/me/messages?access_token={access_token}"
+    
+    async with httpx.AsyncClient() as client:
+        # 1. Send Text Reply
+        if message_text:
+            try:
+                resp = await client.post(fb_url, json={
+                    "recipient": {"id": recipient_id},
+                    "message": {"text": message_text}
+                })
+                if resp.status_code != 200:
+                    print(f"❌ FB Text Error: {resp.status_code} - {resp.text}")
+            except Exception as e:
+                print(f"❌ Error sending FB text: {e}")
+
+        # 2. Send Images
+        if images:
+            for img in images:
+                try:
+                    resp = await client.post(fb_url, json={
+                        "recipient": {"id": recipient_id},
+                        "message": {
+                            "attachment": {
+                                "type": "image",
+                                "payload": {"url": img, "is_reusable": True}
+                            }
+                        }
+                    })
+                    if resp.status_code != 200:
+                        print(f"❌ FB Image Error: {resp.status_code} - {resp.text}")
+                except Exception as e:
+                    print(f"❌ Error sending FB image {img}: {e}")
 
 async def process_multimodal_description(media_url: str, media_type: str):
     """
@@ -33,9 +77,12 @@ async def process_multimodal_description(media_url: str, media_type: str):
     # We use Gemini 2.0 Flash or GPT-4o-mini as they are excellent at multimodal
     model = "google/gemini-2.0-flash-001"
     
-    prompt = "Describe this product in detail for an inventory search. Focus on: item type, color, material, and style. Be concise."
-    if media_type == "audio":
-        prompt = "Transcribe this audio message. If it describes a product, list its features (color, type, etc) for search."
+    prompt = (
+        "Analyze this content for a shop assistant task.\n"
+        "1. If it's an IMAGE: Describe the product (type, color, style, patterns) in very high detail for internal inventory search. Reply with ONLY the description.\n"
+        "2. If it's AUDIO: Transcribe the speech EXACTLY as spoken. If it's in Bengali, transcribe in Bengali.\n"
+        "3. Determine the user's intent. If they show a product, describe it so I can find it in my database."
+    )
 
     content_list = [{"type": "text", "text": prompt}]
     
@@ -67,39 +114,111 @@ async def process_multimodal_description(media_url: str, media_type: str):
             return "Analysis failed."
 
 async def generate_ai_reply(user_message: str, account_id: str = None, media_url: str = None, media_type: str = None):
-    """Generate a reply using PRO-grade Vector Semantic Search and Multimodal support."""
+    """Generate a reply using pHash Visual Search + Vector Semantic Search."""
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         return "AI Key not found."
 
-    # 0. Multimodal Pre-processing: If user sent an image/audio, convert it to a searchable description
-    actual_query = user_message
-    if media_url:
-        print(f"🖼️ [Agent] Processing {media_type} to find products...", flush=True)
-        media_description = await process_multimodal_description(media_url, media_type)
-        actual_query = f"{user_message} [User sent {media_type} described as: {media_description}]"
-        print(f"📖 [Agent] Media Description: {media_description}", flush=True)
-
-    # 1. Fetch Posts and Company Info (including vectors) from DB
+    # STEP 1: Fetch Posts and Company Info from DB (with image hashes)
     posts_data = []
     company_info = ""
+    social_account = None
     if account_id:
         try:
-            # High-performance fetching of posts and company info in one sync block
             def fetch_context():
-                posts = list(SocialPost.objects.filter(
-                    account__account_id=account_id, 
-                ).order_by("-created_at")[:20].values("post_id", "caption", "vector"))
-                
+                posts_qs = SocialPost.objects.filter(
+                    account__account_id=account_id,
+                ).order_by("-created_at")[:20].prefetch_related('media')
+
+                results = []
+                for p in posts_qs:
+                    images_data = [
+                        {"url": m.media_url, "hash": m.image_hash}
+                        for m in p.media.all() if m.media_url
+                    ]
+                    results.append({
+                        "post_id": p.post_id,
+                        "caption": p.caption,
+                        "vector": p.vector,
+                        "images": images_data
+                    })
+
                 acc = SocialAccount.objects.select_related('company').get(account_id=account_id)
                 comp = acc.company
-                c_info = f"\nCompany Profile: {comp.name} - {comp.description} ({comp.type}).\n" if comp else ""
-                
-                return posts, c_info
+                c_info = f"Company Profile: {comp.name} - {comp.description} ({comp.type})." if comp else ""
+                return results, c_info, acc
 
-            posts_data, company_info = await sync_to_async(fetch_context)()
+            posts_data, company_info, social_account = await sync_to_async(fetch_context)()
         except Exception as e:
             print(f"⚠️ Context fetch error: {e}", flush=True)
+
+    # STEP 2: USER SENT AN IMAGE → Try pHash visual match first (most accurate)
+    if media_url and media_type == "image" and posts_data:
+        print(f"🔎 [Visual] Attempting pHash visual search...", flush=True)
+        query_hash = await anyio.to_thread.run_sync(compute_phash_from_url, media_url)
+        if query_hash:
+            print(f"🖼️ [Visual] Query image pHash: {query_hash}")
+            visual_match = await anyio.to_thread.run_sync(
+                find_best_visual_match, query_hash, posts_data, 15
+            )
+            if visual_match:
+                caption = visual_match.get('caption', '')
+                dist = visual_match.get('_visual_distance', 0)
+                img_urls = [i['url'] for i in visual_match.get('images', []) if i.get('url')]
+                print(f"✅ [Visual] EXACT visual match! Distance: {dist} | Caption: {caption[:60]}")
+
+                # Build direct-reply prompt using verified matched product data
+                matched_info = f"EXACT PRODUCT MATCH (Hamming distance: {dist}):\n{caption}"
+                system_prompt = (
+                    "You are a human Shop Assistant. The user sent a product image.\n"
+                    "It was found in our inventory using visual fingerprint matching.\n"
+                    "Reply NATURALLY confirming we have it. Include price and sizes from the product info.\n"
+                    "At the END, add: IMAGE_URLS: followed by the URLs comma-separated.\n"
+                    "DO NOT make up any info. Only use what is provided."
+                )
+                if company_info:
+                    system_prompt += f"\n\nShop: {company_info}"
+                system_prompt += f"\n\nProduct Info:\n{matched_info}"
+                if img_urls:
+                    system_prompt += f"\n\nIMAGE_URLS: {','.join(img_urls)}"
+
+                async with httpx.AsyncClient() as client:
+                    try:
+                        resp = await client.post(
+                            "https://openrouter.ai/api/v1/chat/completions",
+                            headers={"Authorization": f"Bearer {api_key.strip()}"},
+                            json={
+                                "model": "google/gemini-2.0-flash-001",
+                                "messages": [
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": user_message or "Found my product?"}
+                                ]
+                            },
+                            timeout=25.0
+                        )
+                        if resp.status_code == 200:
+                            return resp.json()["choices"][0]["message"]["content"]
+                    except Exception as e:
+                        print(f"❌ [Visual] LLM delivery error: {e}")
+
+            else:
+                print(f"⚠️ [Visual] No visual match within threshold. Falling back to AI description + text search.")
+        else:
+            print(f"⚠️ [Visual] pHash failed. Falling back to AI description.")
+
+    # STEP 3: Audio OR no visual match → Use Multimodal description + text/vector search
+    actual_query = user_message or ""
+    if media_url and not (media_type == "image" and posts_data):
+        print(f"🖼️ [Agent] Processing {media_type} via AI description...", flush=True)
+        media_description = await process_multimodal_description(media_url, media_type)
+        actual_query = f"{user_message} [User sent {media_type}: {media_description}]"
+        print(f"📖 [Agent] Media Description: {media_description}", flush=True)
+    elif media_url and media_type == "image":
+        # Visual search failed - still describe image for text search
+        print(f"🖼️ [Agent] Describing image for fallback text search...")
+        media_description = await process_multimodal_description(media_url, media_type)
+        actual_query = f"{user_message} [User sent image: {media_description}]"
+
 
     # 2. Get Vector for current User Message (Semantic Embedding)
     user_msg_vector = []
@@ -161,11 +280,16 @@ async def generate_ai_reply(user_message: str, account_id: str = None, media_url
         "You are an AI Shop Assistant for MetaForge. Talk naturally like a real person. "
         "Your only job is to provide product information from the 'Shop Context' below. "
         "\n\nSTRICT RULES:\n"
-        "1. ONLY use data from the 'Shop Context'. If a product or price is not there, say you cannot find it.\n"
-        "2. Do NOT invent prices, currencies, or details (like ratings or fake websites).\n"
-        "3. NEVER output JSON, code blocks, or special formatted lists. Talk as if you are in a chat.\n"
-        "4. Use the specific currency (e.g., BDT) shown in the context.\n"
-        "5. If you see a price like '1,630.00 BDT', use exactly that."
+        "1. BE CRITICAL: Check the 'Match Confidence' score in the context. \n"
+        "   - If Confidence > 0.70: You can say 'Yes, we have it!'\n"
+        "   - If Confidence is between 0.45 and 0.70: Be cautious. Say 'I found something similar' and describe it instead of confirming a direct match.\n"
+        "   - If Confidence < 0.45 or no results: Say 'I'm sorry, I couldn't find a match in our current inventory.'\n"
+        "2. LANGUAGE MATCHING: Respond in the EXACT same language the user used.\n"
+        "3. PRODUCT SEARCH: Carefully compare the user's request (or image description) with the 'Shop Context'.\n"
+        "4. IMAGE_URLS: If you find a matching product, you MUST include ALL its image URLs. "
+        "   At the VERY end of your response, add the tag 'IMAGE_URLS:' followed by ALL URLs separated by commas.\n"
+        "5. DO NOT INVENT DATA: Never make up prices or availability.\n"
+        "6. NO JSON: Talk like a human, no code blocks."
     )
     if company_info:
         system_prompt += f"\n\nShop Background: {company_info}"
@@ -240,9 +364,28 @@ async def unified_webhook_fastapi(platform: str, request: Request):
                     return {"status": "no_messaging"}
 
                 msg_event = messaging[0]
-                client_id = msg_event.get("sender", {}).get("id")
+                mid = msg_event.get("message", {}).get("mid")
+                
+                # 🛑 HALT: If we already processed this message ID, skip!
+                if mid in PROCESSED_MIDS:
+                    print(f"⏭️ [fb] Skipping already processed message: {mid}", flush=True)
+                    return {"status": "already_processed"}
+                
+                # Add to cache (keep last 100 to save memory)
+                PROCESSED_MIDS.add(mid)
+                if len(PROCESSED_MIDS) > 100:
+                    PROCESSED_MIDS.pop()
+
+                sender_id = msg_event.get("sender", {}).get("id")
+                recipient_id = msg_event.get("recipient", {}).get("id")
                 message = msg_event.get("message", {})
                 
+                # 🛡️ IMPORTANT: Guard against Echo Messages and Meta Auto-Replies
+                if message.get("is_echo") or sender_id == account_id:
+                    print(f"🤫 [fb] Ignoring echo message from {sender_id}", flush=True)
+                    return {"status": "ignored_echo"}
+
+                client_id = sender_id
                 text = message.get("text", "")
                 attachments = message.get("attachments", [])
                 
@@ -259,10 +402,22 @@ async def unified_webhook_fastapi(platform: str, request: Request):
                     incoming_log = text if text else f"[{media_type} attachment]"
                     print(f"📘 [{platform}] Message from {client_id}: {incoming_log}", flush=True)
                     
-                    # GENERATE AI REPLY (Now supports multimodal)
+                    # GENERATE AI REPLY (Now supports multimodal and image returns)
                     print(f"🤖 Generating AI reply for: '{incoming_log}'...", flush=True)
                     ai_reply = await generate_ai_reply(text, account_id, media_url, media_type)
-                    print(f"✨ AI REPLY: {ai_reply}", flush=True)
+                    
+                    # Image sending logic
+                    actual_text = ai_reply
+                    extracted_images = []
+                    if "IMAGE_URLS:" in ai_reply:
+                        parts = ai_reply.split("IMAGE_URLS:")
+                        actual_text = parts[0].strip()
+                        extracted_images = [url.strip() for url in parts[1].split(",") if url.strip()]
+
+                    if account: 
+                        await send_facebook_message(client_id, actual_text, extracted_images, account.token)
+                    
+                    print(f"✨ AI REPLY SENT: {actual_text} (Images: {len(extracted_images)})", flush=True)
 
             return {"status": "received"}
 

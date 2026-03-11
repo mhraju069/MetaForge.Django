@@ -70,3 +70,28 @@ def train_post_embedding(post):
             
     except Exception as e:
         print(f"❌ Exception in training post {post.post_id}: {e}")
+
+
+def train_post_image_hash(post):
+    """
+    Generate pHash fingerprints for all images in a post and save them to PostMedia.
+    This enables pixel-level visual similarity search.
+    Called via signals when a post or PostMedia is saved.
+    """
+    from .image_search import compute_phash_from_url
+
+    media_items = PostMedia.objects.filter(post=post, image_hash__isnull=True)
+    if not media_items.exists():
+        return
+
+    print(f"🖼️ [pHash] Generating image fingerprints for post {post.post_id}...")
+    updated = 0
+    for m in media_items:
+        if m.media_url:
+            h = compute_phash_from_url(m.media_url)
+            if h:
+                PostMedia.objects.filter(id=m.id).update(image_hash=h)
+                updated += 1
+                print(f"  ✅ [pHash] Saved hash for media {m.id}: {h}")
+    
+    print(f"  📊 [pHash] {updated} image fingerprints saved for post {post.post_id}")

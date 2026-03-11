@@ -42,8 +42,8 @@ fn search_context(query_vector_json: String, posts_json: String, limit: usize) -
 
     let mut context = String::new();
     for (score, caption) in scored_posts.iter().take(limit) {
-        if *score > 0.35 {
-            context.push_str(&format!("- Product Info: {}\n", caption));
+        if *score > 0.45 {
+            context.push_str(&format!("- Product Info (Match Confidence: {:.2}): {}\n", score, caption));
         }
     }
     Ok(context)

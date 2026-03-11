@@ -41,6 +41,8 @@ class PostMedia(models.Model):
     post = models.ForeignKey(SocialPost,related_name="media",on_delete=models.CASCADE)
     media = models.ImageField(upload_to="posts", null=True, blank=True)
     media_url = models.TextField(null=True, blank=True)
+    # Perceptual Hash (pHash) - 64-bit fingerprint of the image for visual similarity search
+    image_hash = models.CharField(max_length=64, null=True, blank=True, help_text="pHash fingerprint for visual similarity search")
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
