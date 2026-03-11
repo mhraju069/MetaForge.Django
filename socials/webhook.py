@@ -5,7 +5,7 @@ from django.http import HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.utils import timezone
+from django.utils import timezon
 import json, requests, httpx
 import anyio
 from .models import *
@@ -314,13 +314,15 @@ async def generate_ai_reply(
         "Use the 'Shop Context' to answer product questions. "
         "You have full conversation history - use it to understand follow-up questions.\n\n"
         "STRICT RULES:\n"
-        "1. USE HISTORY: If user refers to something earlier ('that dress', 'the first one', 'its price'), use history to understand context.\n"
+        "1. USE HISTORY: If user refers to something mentioned earlier ('that dress', 'the first one', 'its price'), use conversation history to understand what they mean.\n"
         "2. BE CRITICAL on confidence scores:\n"
         "   - Score > 0.70: Confirm 'Yes, we have it!'\n"
         "   - Score 0.45-0.70: Say 'I found something similar'\n"
-        "   - Score < 0.45 or nothing: Say you could not find it.\n"
+        "   - Score < 0.45 or no match: Say you could not find it.\n"
         "3. LANGUAGE: Reply in the EXACT language the user used.\n"
-        "4. IMAGE_URLS: If product found, append 'IMAGE_URLS: url1,url2' at very end of reply.\n"
+        "4. IMAGE_URLS: ONLY use image URLs from 'Shop Context' or 'Matched Product' section.\n"
+        "   ⚠️ NEVER use URLs from conversation history - those are images the user sent, NOT shop product images.\n"
+        "   Append at very end: IMAGE_URLS: url1,url2\n"
         "5. NO INVENTED DATA: Never make up prices or sizes.\n"
         "6. NO JSON: Speak like a human."
     )
@@ -451,13 +453,21 @@ async def unified_webhook_fastapi(platform: str, request: Request):
                         def save_messages():
                             acc = SocialAccount.objects.get(account_id=account_id)
                             conv, _ = Conversation.objects.get_or_create(account=acc, sender_id=client_id)
-                            # User message
-                            user_content = text if text else f"[{media_type}: {media_url}]"
+                            # ✅ Save user message as clean text - NEVER store raw media URLs
+                            # Storing raw FB CDN URLs in history causes AI to send them back as product images
+                            if text:
+                                user_content = text
+                            elif media_type == "image":
+                                user_content = "[User sent a product image for search]"
+                            elif media_type == "audio":
+                                user_content = "[User sent a voice message]"
+                            else:
+                                user_content = f"[User sent {media_type} attachment]"
                             Message.objects.create(
                                 conversation=conv,
                                 role="user",
                                 content=user_content,
-                                media_url=media_url,
+                                media_url=None,       # ✅ Do NOT store CDN URL in history content
                                 media_type=media_type,
                             )
                             # AI reply
