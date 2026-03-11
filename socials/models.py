@@ -51,3 +51,45 @@ class PostMedia(models.Model):
         return f"{self.post.post_id} - {self.post.account.platform}"
 
 
+class Conversation(models.Model):
+    """
+    Represents a chat thread between a platform user (customer)
+    and the AI shop assistant for a specific social account.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    account = models.ForeignKey(SocialAccount, related_name="conversations", on_delete=models.CASCADE)
+    # The platform user's ID (e.g. Facebook sender_id)
+    sender_id = models.CharField(max_length=200)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        # One conversation per user per account
+        unique_together = ("account", "sender_id")
+        ordering = ["-updated_at"]
+
+    def __str__(self):
+        return f"Conv [{self.account.platform}] {self.sender_id}"
+
+
+class Message(models.Model):
+    """
+    A single message in a conversation.
+    role: 'user' (customer message) or 'assistant' (AI reply)
+    """
+    ROLE_CHOICES = (("user", "User"), ("assistant", "Assistant"))
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    conversation = models.ForeignKey(Conversation, related_name="messages", on_delete=models.CASCADE)
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES)
+    content = models.TextField()
+    # Optional: store if media was involved
+    media_url = models.TextField(null=True, blank=True)
+    media_type = models.CharField(max_length=20, null=True, blank=True)  # image, audio, video
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"[{self.role}] {self.content[:50]}"
