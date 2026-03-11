@@ -3,6 +3,56 @@ import os
 from django.conf import settings
 from .models import *
 
+
+def detect_is_product(post) -> bool:
+    """
+    Use AI to detect if a social media post is about a product (for sale).
+    Returns True if it's a product post, False otherwise.
+    Uses a cheap/fast binary classification prompt.
+    """
+    if not post.caption or not post.caption.strip():
+        return False
+
+    api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return False
+
+    caption = post.caption.strip()[:500]  # Limit to 500 chars to save cost
+
+    prompt = (
+        "You are a product classifier for a social media shop manager.\n"
+        "Read this social media post caption and answer ONLY with 'YES' or 'NO'.\n"
+        "Question: Is this post about a product that is being sold or offered for sale?\n"
+        "Rules:\n"
+        "- YES: if it mentions a product with price, size, material, or availability\n"
+        "- NO: if it is a greeting, announcement, story, celebration, or non-product content\n"
+        f"\nCaption:\n{caption}\n\nAnswer (YES or NO only):"
+    )
+
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key.strip()}"},
+            json={
+                "model": "google/gemini-2.0-flash-001",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 5,
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            answer = resp.json()["choices"][0]["message"]["content"].strip().upper()
+            is_product = answer.startswith("YES")
+            print(f"🤖 [ProductDetect] Post {post.post_id}: '{caption[:40]}...' → {'✅ PRODUCT' if is_product else '❌ NOT PRODUCT'}")
+            return is_product
+        else:
+            print(f"⚠️ [ProductDetect] API error: {resp.status_code}")
+            return False
+    except Exception as e:
+        print(f"❌ [ProductDetect] Exception: {e}")
+        return False
+
+
 def subscribe_page_to_webhook(page_id, page_access_token,page_name):
     """Subscribe a Facebook Page to receive webhook events."""
     try:

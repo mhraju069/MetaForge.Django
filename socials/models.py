@@ -30,6 +30,8 @@ class SocialPost(models.Model):
     post_id = models.CharField(max_length=200)
     caption = models.TextField()
     vector = models.JSONField(null=True, blank=True)
+    # AI-detected: Is this post about a product? None=unchecked, True=product, False=not a product
+    is_product = models.BooleanField(null=True, blank=True, default=None)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

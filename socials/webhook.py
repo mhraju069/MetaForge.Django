@@ -128,6 +128,7 @@ async def generate_ai_reply(user_message: str, account_id: str = None, media_url
             def fetch_context():
                 posts_qs = SocialPost.objects.filter(
                     account__account_id=account_id,
+                    is_product=True,  # ✅ Only product posts for AI search
                 ).order_by("-created_at")[:20].prefetch_related('media')
 
                 results = []
