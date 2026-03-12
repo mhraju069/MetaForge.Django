@@ -5,7 +5,7 @@ from django.http import HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.utils import timezon
+from django.utils import timezone
 import json, requests, httpx
 import anyio
 from .models import *
@@ -128,13 +128,16 @@ async def generate_ai_reply(
     # ── STEP 1: Fetch product posts from DB ───────────────────────────────────
     posts_data = []
     company_info = ""
+    company_name = "our shop"      # fallback
+    company_type = ""
+    company_address = ""
     social_account = None
     if account_id:
         try:
             def fetch_context():
                 posts_qs = SocialPost.objects.filter(
                     account__account_id=account_id,
-                    is_product=True,  # ✅ Only confirmed product posts
+                    is_product=True,
                 ).order_by("-created_at")[:20].prefetch_related("media")
 
                 results = []
@@ -152,10 +155,19 @@ async def generate_ai_reply(
 
                 acc = SocialAccount.objects.select_related("company").get(account_id=account_id)
                 comp = acc.company
-                c_info = f"Company: {comp.name} - {comp.description} ({comp.type})." if comp else ""
-                return results, c_info, acc
+                c_name = comp.name or "our shop" if comp else "our shop"
+                c_type = comp.type or "" if comp else ""
+                c_desc = comp.description or "" if comp else ""
+                c_addr = comp.address or "" if comp else ""
+                # Full company background for AI context
+                c_info_parts = [f"{c_name}", c_type, c_desc]
+                if c_addr:
+                    c_info_parts.append(f"Address: {c_addr}")
+                c_info = " | ".join(p for p in c_info_parts if p)
+                return results, c_info, acc, c_name, c_type, c_addr
 
-            posts_data, company_info, social_account = await sync_to_async(fetch_context)()
+            posts_data, company_info, social_account, company_name, company_type, company_address = await sync_to_async(fetch_context)()
+            print(f"🏪 [Company] Loaded as: '{company_name}'", flush=True)
         except Exception as e:
             print(f"⚠️ Context fetch error: {e}", flush=True)
 
@@ -169,7 +181,6 @@ async def generate_ai_reply(
 
                 # Smart Window: last 20 msgs within 24 hours only
                 # (older context is usually irrelevant for a shopping session)
-                from django.utils import timezone
                 import datetime
                 cutoff = timezone.now() - datetime.timedelta(hours=24)
 
@@ -219,15 +230,15 @@ async def generate_ai_reply(
                 print(f"✅ [Visual] EXACT match! Distance: {dist} | {caption[:60]}")
 
                 sys_prompt = (
-                    "You are a human Shop Assistant. The user sent a product image.\n"
-                    "It was EXACTLY matched in our inventory using visual fingerprint search.\n"
-                    "Reply NATURALLY confirming we have it. Include price, sizes from the product info.\n"
-                    "At the END of your reply, add: IMAGE_URLS: followed by URLs comma-separated.\n"
-                    "DO NOT invent any data. Only use what is provided below."
+                    f"You are the official AI assistant for '{company_name}'.\n"
+                    f"A customer sent a product image and it was EXACTLY matched in {company_name}'s inventory.\n"
+                    "Reply WARMLY and NATURALLY confirming you have it. Mention the price and sizes if available.\n"
+                    "At the END of your reply add: IMAGE_URLS: followed by product URLs comma-separated.\n"
+                    "⚠️ Only use URLs from the Product Info below. DO NOT invent any information."
                 )
                 if company_info:
-                    sys_prompt += f"\n\nShop: {company_info}"
-                sys_prompt += f"\n\nMatched Product:\n{caption}"
+                    sys_prompt += f"\n\n--- {company_name} Info ---\n{company_info}"
+                sys_prompt += f"\n\n--- Matched Product ---\n{caption}"
                 if img_urls:
                     sys_prompt += f"\n\nIMAGE_URLS: {','.join(img_urls)}"
 
@@ -308,26 +319,27 @@ async def generate_ai_reply(
     if not final_context and posts_data:
         final_context = "Recent Products:\n" + "\n".join([f"- {p['caption']}" for p in posts_data[:10]])
 
-    # ── STEP 7: Build system prompt + inject history + call LLM ───────────────
+    # ── STEP 7: Build company-personalized system prompt + inject history ─────
     system_prompt = (
-        "You are an AI Shop Assistant. Talk naturally like a real person. "
-        "Use the 'Shop Context' to answer product questions. "
+        f"You are the official AI shopping assistant for '{company_name}'.\n"
+        f"You represent '{company_name}' and only this company. Your goal is to help customers find products.\n"
         "You have full conversation history - use it to understand follow-up questions.\n\n"
         "STRICT RULES:\n"
-        "1. USE HISTORY: If user refers to something mentioned earlier ('that dress', 'the first one', 'its price'), use conversation history to understand what they mean.\n"
-        "2. BE CRITICAL on confidence scores:\n"
+        "1. IDENTITY: You are the assistant for '" + company_name + "' ONLY. Never mention other brands or companies.\n"
+        "2. USE HISTORY: If user refers to something earlier ('that dress', 'the first one', 'its price'), use conversation history to understand.\n"
+        "3. BE CRITICAL on confidence scores:\n"
         "   - Score > 0.70: Confirm 'Yes, we have it!'\n"
         "   - Score 0.45-0.70: Say 'I found something similar'\n"
-        "   - Score < 0.45 or no match: Say you could not find it.\n"
-        "3. LANGUAGE: Reply in the EXACT language the user used.\n"
-        "4. IMAGE_URLS: ONLY use image URLs from 'Shop Context' or 'Matched Product' section.\n"
-        "   ⚠️ NEVER use URLs from conversation history - those are images the user sent, NOT shop product images.\n"
+        "   - Score < 0.45 or no match: Say you could not find it in " + company_name + "'s inventory.\n"
+        "4. LANGUAGE: Reply in the EXACT language the user used.\n"
+        "5. IMAGE_URLS: ONLY use image URLs from 'Shop Context' or 'Matched Product' section.\n"
+        "   ⚠️ NEVER use URLs from conversation history - those are images the user sent, NOT shop products.\n"
         "   Append at very end: IMAGE_URLS: url1,url2\n"
-        "5. NO INVENTED DATA: Never make up prices or sizes.\n"
-        "6. NO JSON: Speak like a human."
+        "6. NO INVENTED DATA: Never make up prices, sizes, or availability.\n"
+        "7. NO JSON: Speak like a helpful, friendly human assistant."
     )
     if company_info:
-        system_prompt += f"\n\nShop Info: {company_info}"
+        system_prompt += f"\n\n--- {company_name} Background ---\n{company_info}"
     if final_context:
         system_prompt += f"\n\nShop Context:\n{final_context}"
 
