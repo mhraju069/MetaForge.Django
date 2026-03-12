@@ -1,117 +1,167 @@
 import os
+import json
+import datetime
+import httpx
+import anyio
+from collections import OrderedDict
 from fastapi import APIRouter, Request, Response
 from asgiref.sync import sync_to_async
-from django.http import HttpResponse, JsonResponse
+from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-from django.conf import settings
-from django.contrib.auth import get_user_model
 from django.utils import timezone
-import json, requests, httpx
-import anyio
 from .models import *
 from .helper import *
 from .image_search import compute_phash_from_url, find_best_visual_match
 
-# Bridge to Rust
+# ── Rust bridge ───────────────────────────────────────────────────────────────
 try:
     import rust_ai
+    print("✅ [Rust] rust_ai module loaded.", flush=True)
 except ImportError:
     rust_ai = None
+    print("⚠️ [Rust] rust_ai not available — falling back to Python context.", flush=True)
 
 router = APIRouter()
 
-# Global cache to prevent double processing of same mid (message id)
-# In production, use Redis. For now, a memory set works.
-PROCESSED_MIDS = set()
+# ── Dedup cache ───────────────────────────────────────────────────────────────
+# OrderedDict preserves insertion order so we evict the OLDEST mid, not random.
+PROCESSED_MIDS: OrderedDict = OrderedDict()
+MAX_MIDS = 200
 
-# Helper to run Django ORM in async
 sync_check_account = sync_to_async(check_account)
 
-async def send_facebook_message(recipient_id: str, message_text: str, images: list = None, access_token: str = ""):
-    """Sends a text message and optional image attachments to a Facebook user."""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _valid_key(k: str | None) -> str | None:
+    """Return the key if non-empty, else None."""
+    return k.strip() if k and k.strip() else None
+
+
+async def _get_embedding(text: str, api_key: str, openai_key: str | None) -> list:
+    """Fetch text embedding. Prefers OpenAI; falls back to OpenRouter."""
+    if _valid_key(openai_key):
+        url     = "https://api.openai.com/v1/embeddings"
+        headers = {"Authorization": f"Bearer {openai_key.strip()}"}
+        model   = "text-embedding-3-small"
+    elif _valid_key(api_key):
+        url     = "https://openrouter.ai/api/v1/embeddings"
+        headers = {"Authorization": f"Bearer {api_key.strip()}"}
+        model   = "openai/text-embedding-3-small"
+    else:
+        print("⚠️ [Embed] No API key available.")
+        return []
+
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(
+                url, headers=headers,
+                json={"input": text, "model": model},
+                timeout=15.0,
+            )
+            if resp.status_code == 200:
+                return resp.json()["data"][0]["embedding"]
+            print(f"⚠️ [Embed] API error {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            print(f"⚠️ [Embed] Exception: {e}")
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Facebook message sender
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def send_facebook_message(
+    recipient_id: str,
+    message_text: str,
+    images: list = None,
+    access_token: str = "",
+):
     if not access_token:
-        print("❌ Cannot send message: No access token provided.")
+        print("❌ Cannot send message: No access token.")
         return
 
     fb_url = f"https://graph.facebook.com/v20.0/me/messages?access_token={access_token}"
 
     async with httpx.AsyncClient() as client:
-        # 1. Send Text Reply
+        # Text message
         if message_text:
             try:
                 resp = await client.post(fb_url, json={
                     "recipient": {"id": recipient_id},
-                    "message": {"text": message_text}
-                })
+                    "message":   {"text": message_text},
+                }, timeout=10.0)
                 if resp.status_code != 200:
                     print(f"❌ FB Text Error: {resp.status_code} - {resp.text}")
+                else:
+                    print(f"✅ [FB] Text sent to {recipient_id}")
             except Exception as e:
-                print(f"❌ Error sending FB text: {e}")
+                print(f"❌ FB text send error: {e}")
 
-        # 2. Send Images
+        # Image attachments
         if images:
-            for img in images:
+            for img_url in images:
                 try:
                     resp = await client.post(fb_url, json={
                         "recipient": {"id": recipient_id},
                         "message": {
                             "attachment": {
                                 "type": "image",
-                                "payload": {"url": img, "is_reusable": True}
+                                "payload": {"url": img_url, "is_reusable": True},
                             }
-                        }
-                    })
+                        },
+                    }, timeout=10.0)
                     if resp.status_code != 200:
                         print(f"❌ FB Image Error: {resp.status_code} - {resp.text}")
+                    else:
+                        print(f"✅ [FB] Image sent: {img_url[:60]}...")
                 except Exception as e:
-                    print(f"❌ Error sending FB image {img}: {e}")
+                    print(f"❌ FB image send error: {e}")
 
 
-async def process_multimodal_description(media_url: str, media_type: str):
-    """
-    Use a Vision/Audio AI model to convert media into a text description
-    for semantic product search.
-    """
-    api_key = os.getenv("OPENROUTER_API_KEY")
+# ─────────────────────────────────────────────────────────────────────────────
+# Multimodal description (image / audio → text for search)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def process_multimodal_description(media_url: str, media_type: str) -> str:
+    api_key = _valid_key(os.getenv("OPENROUTER_API_KEY"))
     if not api_key:
-        return "No AI Key"
-
-    model = "google/gemini-2.0-flash-001"
+        return "No AI key configured."
 
     prompt = (
-        "Analyze this content for a shop assistant task.\n"
-        "1. If it's an IMAGE: Describe the product (type, color, style, patterns) in very high detail for internal inventory search. Reply with ONLY the description.\n"
-        "2. If it's AUDIO: Transcribe the speech EXACTLY as spoken. If it's in Bengali, transcribe in Bengali.\n"
-        "3. Determine the user's intent. If they show a product, describe it so I can find it in my database."
+        "You are a product image analyzer for a shop assistant.\n"
+        "Describe the product in this image in HIGH DETAIL: type, color, style, material, pattern.\n"
+        "Focus on attributes useful for finding the product in a clothing/fashion inventory.\n"
+        "Reply with ONLY the description, no other text."
     )
-
-    content_list = [{"type": "text", "text": prompt}]
-
+    content = [{"type": "text", "text": prompt}]
     if media_type == "image":
-        content_list.append({"type": "image_url", "image_url": {"url": media_url}})
+        content.append({"type": "image_url", "image_url": {"url": media_url}})
     else:
-        content_list.append({"type": "text", "text": f"\n[Media Link to analyze: {media_url}]"})
+        content.append({"type": "text", "text": f"[Media URL: {media_url}]"})
 
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key.strip()}"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": content_list}]
-                },
-                timeout=30.0
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"model": "google/gemini-2.0-flash-001",
+                      "messages": [{"role": "user", "content": content}]},
+                timeout=30.0,
             )
             if resp.status_code == 200:
                 return resp.json()["choices"][0]["message"]["content"]
-            else:
-                print(f"❌ Multimodal Error: {resp.status_code} - {resp.text}")
-                return "Could not analyze image."
+            print(f"❌ [Multimodal] Error {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
-            print(f"❌ Multimodal Exception: {e}")
-            return "Analysis failed."
+            print(f"❌ [Multimodal] Exception: {e}")
+    return "Could not analyze media."
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core AI reply generator
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def generate_ai_reply(
     user_message: str,
@@ -119,393 +169,435 @@ async def generate_ai_reply(
     media_url: str = None,
     media_type: str = None,
     sender_id: str = None,
-):
-    """Generate a reply using pHash Visual Search + Vector Semantic Search + Conversation Memory."""
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        return "AI Key not found."
+) -> str:
+    """
+    Full pipeline:
+    1.  DB fetch  — product posts + company info
+    2.  History   — 24-hour smart token window
+    3.  Visual    — pHash search for images (temperature=0, no history)
+    4.  Describe  — AI description of media for fallback text search
+    5.  Embed     — vector embed the user query
+    6.  Rust      — cosine similarity search (ultra-fast, in-process)
+    7.  LLM       — generate reply with full context + history
+    """
+    api_key    = _valid_key(os.getenv("OPENROUTER_API_KEY"))
+    openai_key = _valid_key(os.getenv("OPENAI_API_KEY"))
 
-    # ── STEP 1: Fetch product posts from DB ───────────────────────────────────
-    posts_data = []
-    company_info = ""
-    company_name = "our shop"      # fallback
-    company_type = ""
+    if not api_key:
+        return "AI is not configured. Please contact support."
+
+    # ── 1. Fetch posts + company ──────────────────────────────────────────────
+    posts_data    = []
+    company_info  = ""
+    company_name  = "our shop"      # safe fallback
     company_address = ""
-    social_account = None
+
     if account_id:
         try:
             def fetch_context():
-                posts_qs = SocialPost.objects.filter(
+                qs = SocialPost.objects.filter(
                     account__account_id=account_id,
-                    is_product=True,
-                ).order_by("-created_at")[:20].prefetch_related("media")
+                    is_product=True,                # only classified products
+                ).order_by("-created_at")[:30].prefetch_related("media")
 
                 results = []
-                for p in posts_qs:
-                    images_data = [
-                        {"url": m.media_url, "hash": m.image_hash}
+                for p in qs:
+                    imgs = [
+                        {"url": m.media_url, "hash": m.image_hash or ""}
                         for m in p.media.all() if m.media_url
                     ]
                     results.append({
                         "post_id": p.post_id,
-                        "caption": p.caption,
-                        "vector": p.vector,
-                        "images": images_data,
+                        "caption": p.caption or "",
+                        "vector":  p.vector,
+                        "images":  imgs,
                     })
 
-                acc = SocialAccount.objects.select_related("company").get(account_id=account_id)
+                acc  = SocialAccount.objects.select_related("company").get(account_id=account_id)
                 comp = acc.company
-                c_name = comp.name or "our shop" if comp else "our shop"
-                c_type = comp.type or "" if comp else ""
-                c_desc = comp.description or "" if comp else ""
-                c_addr = comp.address or "" if comp else ""
-                # Full company background for AI context
-                c_info_parts = [f"{c_name}", c_type, c_desc]
+
+                # FIX: Use FB page name (acc.name) as primary display name
+                page_name = acc.name or ""
+                if comp:
+                    c_name = page_name or comp.name or "our shop"
+                    c_type = comp.type        or ""
+                    c_desc = comp.description or ""
+                    c_addr = comp.address     or ""
+                else:
+                    c_name = page_name or "our shop"
+                    c_type = c_desc = c_addr = ""
+
+                parts = [p for p in [c_name, c_type, c_desc] if p]
                 if c_addr:
-                    c_info_parts.append(f"Address: {c_addr}")
-                c_info = " | ".join(p for p in c_info_parts if p)
-                return results, c_info, acc, c_name, c_type, c_addr
+                    parts.append(f"Address: {c_addr}")
+                c_info = " | ".join(parts)
+                return results, c_info, c_name, c_addr
 
-            posts_data, company_info, social_account, company_name, company_type, company_address = await sync_to_async(fetch_context)()
-            print(f"🏪 [Company] Loaded as: '{company_name}'", flush=True)
+            posts_data, company_info, company_name, company_address = \
+                await sync_to_async(fetch_context)()
+            print(f"🏪 [Company] '{company_name}' | {len(posts_data)} products", flush=True)
         except Exception as e:
-            print(f"⚠️ Context fetch error: {e}", flush=True)
+            print(f"⚠️ [DB] Context fetch error: {e}", flush=True)
 
-    # ── STEP 2: Load Conversation History (Memory) ────────────────────────────
+    # ── 2. Conversation history (24h, ~3000-char budget) ──────────────────────
     chat_history = []
     if account_id and sender_id:
         try:
             def fetch_history():
-                acc = SocialAccount.objects.get(account_id=account_id)
+                acc  = SocialAccount.objects.get(account_id=account_id)
                 conv, _ = Conversation.objects.get_or_create(account=acc, sender_id=sender_id)
-
-                # Smart Window: last 20 msgs within 24 hours only
-                # (older context is usually irrelevant for a shopping session)
-                import datetime
-                cutoff = timezone.now() - datetime.timedelta(hours=24)
-
-                msgs = conv.messages.filter(
-                    created_at__gte=cutoff
-                ).order_by("-created_at")[:20]  # Fetch more, then trim by token budget
-
-                msgs = list(reversed(msgs))  # Oldest first for LLM
-
-                # Token-aware trim: keep messages until we hit ~3000 chars (~750 tokens)
-                # This prevents huge context windows blowing up API costs
-                TOKEN_CHAR_BUDGET = 3000
-                trimmed = []
-                total_chars = 0
-                for m in reversed(msgs):  # Start from most recent
-                    msg_len = len(m.content)
-                    if total_chars + msg_len > TOKEN_CHAR_BUDGET:
+                cutoff  = timezone.now() - datetime.timedelta(hours=24)
+                msgs = list(reversed(
+                    conv.messages.filter(created_at__gte=cutoff)
+                                 .order_by("-created_at")[:20]
+                ))
+                # Trim to token budget (newest-first trim)
+                budget, trimmed, total = 3000, [], 0
+                for m in reversed(msgs):
+                    cost = len(m.content)
+                    if total + cost > budget:
                         break
-                    trimmed.insert(0, m)  # Prepend to maintain order
-                    total_chars += msg_len
-
+                    trimmed.insert(0, m)
+                    total += cost
                 return trimmed
 
-            history_msgs = await sync_to_async(fetch_history)()
-            for m in history_msgs:
-                chat_history.append({"role": m.role, "content": m.content})
-            if chat_history:
-                print(f"💬 [Memory] Loaded {len(chat_history)} msgs ({sum(len(m['content']) for m in chat_history)} chars) from history")
-            else:
-                print("💬 [Memory] No recent history (fresh conversation or >24h gap)")
+            msgs = await sync_to_async(fetch_history)()
+            chat_history = [{"role": m.role, "content": m.content} for m in msgs]
+            chars = sum(len(m["content"]) for m in chat_history)
+            print(f"💬 [Memory] {len(chat_history)} msgs / {chars} chars")
         except Exception as e:
-            print(f"⚠️ [Memory] Failed to load history: {e}")
+            print(f"⚠️ [Memory] Load failed: {e}")
 
-    # ── STEP 3: IMAGE → pHash Visual Search (pixel-level match) ──────────────
+    # ── 3. IMAGE → pHash visual search ───────────────────────────────────────
+    # Design note: No history injected here.
+    # When a pixel-level match exists, the product IS confirmed.
+    # We use temperature=0 to eliminate all hallucination.
+    # ─────────────────────────────────────────────────────────────────────────
     if media_url and media_type == "image" and posts_data:
-        print("🔎 [Visual] Attempting pHash visual search...", flush=True)
+        print("🔎 [Visual] pHash search...", flush=True)
         query_hash = await anyio.to_thread.run_sync(compute_phash_from_url, media_url)
+
         if query_hash:
-            print(f"🖼️ [Visual] Query pHash: {query_hash}")
             visual_match = await anyio.to_thread.run_sync(
                 find_best_visual_match, query_hash, posts_data, 15
             )
+
             if visual_match:
-                caption = visual_match.get("caption", "")
-                dist = visual_match.get("_visual_distance", 0)
+                caption  = visual_match.get("caption", "")
+                dist     = visual_match.get("_visual_distance", 0)
                 img_urls = [i["url"] for i in visual_match.get("images", []) if i.get("url")]
-                print(f"✅ [Visual] EXACT match! Distance: {dist} | {caption[:60]}")
+
+                confidence = (
+                    "IDENTICAL — pixel-perfect match" if dist == 0 else
+                    "VERY HIGH confidence"            if dist <= 5 else
+                    "HIGH confidence"
+                )
+                print(f"✅ [Visual] {confidence} | dist={dist} | {caption[:60]}")
 
                 sys_prompt = (
-                    f"You are the official AI assistant for '{company_name}'.\n"
-                    f"A customer sent a product image and it was EXACTLY matched in {company_name}'s inventory.\n"
-                    "Reply WARMLY and NATURALLY confirming you have it. Mention the price and sizes if available.\n"
-                    "At the END of your reply add: IMAGE_URLS: followed by product URLs comma-separated.\n"
-                    "⚠️ Only use URLs from the Product Info below. DO NOT invent any information."
+                    f"You are the AI shopping assistant for '{company_name}'.\n\n"
+                    "══ SITUATION ══\n"
+                    "A customer sent a product image.\n"
+                    f"Our visual fingerprint system found a {confidence} match "
+                    f"(Hamming distance: {dist}/64).\n"
+                    "The product HAS been identified. It IS in our inventory.\n\n"
+                    "══ YOUR ONLY JOB ══\n"
+                    "1. Confirm warmly that yes, we have this product.\n"
+                    "2. Share the name, price, and sizes from the Product Data below.\n"
+                    "3. Invite them to order or ask questions.\n\n"
+                    "══ ABSOLUTE PROHIBITIONS ══\n"
+                    "✗ NEVER ask for more pictures — product is already found.\n"
+                    "✗ NEVER say you couldn't find it — you DID.\n"
+                    "✗ NEVER ask what they're looking for — you already know.\n"
+                    "✗ NEVER put image URLs inside text — use IMAGE_URLS tag only.\n"
+                    "✗ NEVER invent prices, sizes, or data.\n\n"
+                    "══ FORMAT ══\n"
+                    "Natural, friendly confirmation message.\n"
+                    "Last line must be exactly:\n"
+                    "IMAGE_URLS: url1,url2\n"
                 )
                 if company_info:
-                    sys_prompt += f"\n\n--- {company_name} Info ---\n{company_info}"
-                sys_prompt += f"\n\n--- Matched Product ---\n{caption}"
+                    sys_prompt += f"\n══ SHOP INFO ══\n{company_info}\n"
+                sys_prompt += f"\n══ MATCHED PRODUCT DATA ══\n{caption}\n"
                 if img_urls:
-                    sys_prompt += f"\n\nIMAGE_URLS: {','.join(img_urls)}"
+                    sys_prompt += f"\nProduct image URLs: {', '.join(img_urls)}\n"
+
+                user_turn = "I sent a product image. Please confirm it and give me the details."
+                if user_message:
+                    user_turn += f" ({user_message})"
 
                 async with httpx.AsyncClient() as client:
                     try:
-                        lm_msgs = [{"role": "system", "content": sys_prompt}]
-                        lm_msgs.extend(chat_history)
-                        lm_msgs.append({"role": "user", "content": user_message or "Do you have this product?"})
                         resp = await client.post(
                             "https://openrouter.ai/api/v1/chat/completions",
-                            headers={"Authorization": f"Bearer {api_key.strip()}"},
-                            json={"model": "google/gemini-2.0-flash-001", "messages": lm_msgs},
+                            headers={"Authorization": f"Bearer {api_key}"},
+                            json={
+                                "model":    "google/gemini-2.0-flash-001",
+                                "messages": [
+                                    {"role": "system", "content": sys_prompt},
+                                    {"role": "user",   "content": user_turn},
+                                ],
+                                "temperature": 0,
+                            },
                             timeout=25.0,
                         )
                         if resp.status_code == 200:
                             return resp.json()["choices"][0]["message"]["content"]
+                        print(f"❌ [Visual] LLM error {resp.status_code}: {resp.text[:200]}")
                     except Exception as e:
-                        print(f"❌ [Visual] LLM error: {e}")
+                        print(f"❌ [Visual] LLM exception: {e}")
+                # Fall through to text search if LLM call failed
             else:
-                print("⚠️ [Visual] No match found. Falling back to text search.")
+                print("⚠️ [Visual] No match within threshold. → text search")
         else:
-            print("⚠️ [Visual] pHash failed. Falling back to AI description.")
+            print("⚠️ [Visual] pHash failed. → text search")
 
-    # ── STEP 4: Text/Audio OR image fallback → description + vector search ────
+    # ── 4. Media description for text/fallback search ─────────────────────────
     actual_query = user_message or ""
     if media_url:
-        print(f"🖼️ [Agent] Getting AI description for {media_type}...", flush=True)
-        media_description = await process_multimodal_description(media_url, media_type)
-        actual_query = f"{user_message} [User sent {media_type}: {media_description}]"
-        print(f"📖 [Agent] Description: {media_description}", flush=True)
+        print(f"🖼️  AI description for {media_type}...", flush=True)
+        desc = await process_multimodal_description(media_url, media_type)
+        actual_query = f"{user_message or ''} [User sent {media_type}: {desc}]".strip()
+        print(f"📖 Media description: {desc[:100]}", flush=True)
 
-    # ── STEP 5: Vector Embedding of user query ─────────────────────────────────
-    user_msg_vector = []
+    # ── 5. Vector embedding ────────────────────────────────────────────────────
+    user_vec = []
     if posts_data and actual_query:
-        openai_key = os.getenv("OPENAI_API_KEY")
-        async with httpx.AsyncClient() as client:
-            try:
-                if openai_key and openai_key.strip():
-                    emb_url = "https://api.openai.com/v1/embeddings"
-                    emb_headers = {"Authorization": f"Bearer {openai_key.strip()}"}
-                    emb_model = "text-embedding-3-small"
-                else:
-                    emb_url = "https://openrouter.ai/api/v1/embeddings"
-                    emb_headers = {"Authorization": f"Bearer {api_key.strip()}"}
-                    emb_model = "openai/text-embedding-3-small"
+        print("🧬 [Embed] Generating query vector...", flush=True)
+        user_vec = await _get_embedding(actual_query, api_key, openai_key)
+        if user_vec:
+            print(f"🧬 [Embed] Vector ready (dim={len(user_vec)}) for: {actual_query[:60]}")
 
-                emb_resp = await client.post(
-                    emb_url, headers=emb_headers,
-                    json={"input": actual_query, "model": emb_model}
-                )
-                if emb_resp.status_code == 200:
-                    user_msg_vector = emb_resp.json()["data"][0]["embedding"]
-                    print(f"🧬 Generated Vector for: {actual_query[:40]}...")
-                else:
-                    print(f"⚠️ Embedding error: {emb_resp.status_code}")
-            except Exception as e:
-                print(f"⚠️ Embedding failed: {e}")
-
-    # ── STEP 6: Rust Vector Search or text fallback ────────────────────────────
+    # ── 6. Rust cosine search ──────────────────────────────────────────────────
     final_context = ""
-    if rust_ai and user_msg_vector:
+    if rust_ai and user_vec:
         try:
-            print("🤖 [Agent] Rust vector search...")
-            search_results = await anyio.to_thread.run_sync(
+            print("🤖 [Rust] Cosine search...", flush=True)
+            result = await anyio.to_thread.run_sync(
                 rust_ai.search_context,
-                json.dumps(user_msg_vector),
+                json.dumps(user_vec),
                 json.dumps(posts_data),
-                10
+                5,
             )
-            if search_results and search_results.strip():
-                print("✅ [Agent] Context found via Rust search.")
-                final_context = search_results
+            if result and result.strip():
+                print(f"✅ [Rust] Context: {len(result)} chars")
+                final_context = result
             else:
-                print("⚠️ [Agent] No relevant products found.")
+                print("⚠️ [Rust] No products above 0.45 threshold.")
         except Exception as e:
-            print(f"❌ [Agent] Rust search error: {e}")
+            print(f"❌ [Rust] Search error: {e}")
 
+    # Fallback: plain list with image URLs if Rust returned nothing
     if not final_context and posts_data:
-        final_context = "Recent Products:\n" + "\n".join([f"- {p['caption']}" for p in posts_data[:10]])
+        lines = []
+        for p in posts_data[:10]:
+            line = f"- {p['caption']}"
+            imgs = [i["url"] for i in p.get("images", []) if i.get("url")]
+            if imgs:
+                line += f"\n  Image URLs: {', '.join(imgs)}"
+            lines.append(line)
+        final_context = "Available Products:\n" + "\n".join(lines)
+        print(f"📦 [Fallback] Context built: {len(posts_data)} products", flush=True)
 
-    # ── STEP 7: Build company-personalized system prompt + inject history ─────
+    # ── 7. LLM with history ────────────────────────────────────────────────────
     system_prompt = (
         f"You are the official AI shopping assistant for '{company_name}'.\n"
-        f"You represent '{company_name}' and only this company. Your goal is to help customers find products.\n"
-        "You have full conversation history - use it to understand follow-up questions.\n\n"
-        "STRICT RULES:\n"
-        "1. IDENTITY: You are the assistant for '" + company_name + "' ONLY. Never mention other brands or companies.\n"
-        "2. USE HISTORY: If user refers to something earlier ('that dress', 'the first one', 'its price'), use conversation history to understand.\n"
-        "3. BE CRITICAL on confidence scores:\n"
-        "   - Score > 0.70: Confirm 'Yes, we have it!'\n"
-        "   - Score 0.45-0.70: Say 'I found something similar'\n"
-        "   - Score < 0.45 or no match: Say you could not find it in " + company_name + "'s inventory.\n"
-        "4. LANGUAGE: Reply in the EXACT language the user used.\n"
-        "5. IMAGE_URLS: ONLY use image URLs from 'Shop Context' or 'Matched Product' section.\n"
-        "   ⚠️ NEVER use URLs from conversation history - those are images the user sent, NOT shop products.\n"
-        "   Append at very end: IMAGE_URLS: url1,url2\n"
-        "6. NO INVENTED DATA: Never make up prices, sizes, or availability.\n"
-        "7. NO JSON: Speak like a helpful, friendly human assistant."
+        f"You represent '{company_name}' exclusively.\n"
+        "You have the full conversation history — use it to understand follow-up questions.\n\n"
+        "══ CAPABILITIES ══\n"
+        "✅ You CAN send product images to the customer.\n"
+        "   Add at the VERY END of your reply (new line):\n"
+        "   IMAGE_URLS: url1,url2\n"
+        "   The system delivers images automatically — you do not need to explain this.\n\n"
+        "══ RULES ══\n"
+        f"1. IDENTITY: You are '{company_name}' assistant ONLY. Never mention competitors.\n"
+        "2. HISTORY: Use conversation history to understand references like:\n"
+        "   'that dress', 'the first one', 'its price', 'send picture', 'show me'.\n"
+        "   When they ask for a picture of a discussed product, find its URLs in Shop Context\n"
+        "   and include IMAGE_URLS at the end of your reply.\n"
+        "3. IMAGES ON REQUEST: If user says 'send picture', 'show me', 'photo', 'ছবি পাঠাও',\n"
+        "   find the product in Shop Context and ALWAYS include IMAGE_URLS.\n"
+        "4. CONFIDENCE:\n"
+        "   - Match > 0.70 → 'Yes, we have it!' + details + IMAGE_URLS\n"
+        "   - Match 0.45–0.70 → 'I found something similar' + details + IMAGE_URLS\n"
+        f"   - No match → apologize, say not found in {company_name}.\n"
+        "5. LANGUAGE: Reply in the EXACT language the user used.\n"
+        "6. IMAGE_URLS SOURCE: ONLY use URLs from 'Shop Context' section below.\n"
+        "   ⛔ NEVER use URLs from conversation history (those are user-uploaded images).\n"
+        "   ⛔ NEVER say 'I cannot send images' — you CAN, use the tag.\n"
+        "7. NO INVENTED DATA: Never make up prices, sizes, or stock.\n"
+        "8. NATURAL TONE: Speak like a friendly, knowledgeable shop assistant."
     )
     if company_info:
-        system_prompt += f"\n\n--- {company_name} Background ---\n{company_info}"
+        system_prompt += f"\n\n── {company_name} Info ──\n{company_info}"
     if final_context:
-        system_prompt += f"\n\nShop Context:\n{final_context}"
+        system_prompt += f"\n\n── Shop Context ──\n{final_context}"
 
-    print(f"✉️ [Agent] Context: {len(final_context)} chars | History: {len(chat_history)} msgs")
+    print(f"✉️  LLM call | context={len(final_context)}c | history={len(chat_history)}msgs")
 
     async with httpx.AsyncClient() as client:
         try:
             lm_msgs = [{"role": "system", "content": system_prompt}]
-            lm_msgs.extend(chat_history)  # 📚 Full conversation history injected here
+            lm_msgs.extend(chat_history)
             lm_msgs.append({"role": "user", "content": actual_query})
 
             resp = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key.strip()}"},
+                headers={"Authorization": f"Bearer {api_key}"},
                 json={"model": "google/gemini-2.0-flash-001", "messages": lm_msgs},
-                timeout=25.0,
+                timeout=30.0,
             )
             if resp.status_code == 200:
                 return resp.json()["choices"][0]["message"]["content"]
-            else:
-                print(f"❌ LLM error: {resp.status_code} - {resp.text}")
-                return "I'm sorry, I'm having trouble retrieving details right now."
+            print(f"❌ LLM error {resp.status_code}: {resp.text[:300]}")
+            return "I'm having trouble right now. Please try again in a moment!"
         except Exception as e:
-            print(f"❌ AI delivery error: {e}")
-            return "I'm having trouble connecting to my brain right now."
+            print(f"❌ LLM exception: {e}")
+            return "Connection issue. Please try again shortly!"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Webhook entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 @router.api_route("/{platform}/", methods=["GET", "POST"])
 async def unified_webhook_fastapi(platform: str, request: Request):
-    print(f"📡 [FastAPI] Incoming request for platform: {platform}", flush=True)
+    print(f"📡 [{platform}] {request.method}", flush=True)
 
+    # ── GET: Facebook webhook verification ────────────────────────────────────
     if request.method == "GET":
-        token = request.query_params.get("hub.verify_token")
+        token     = request.query_params.get("hub.verify_token")
         challenge = request.query_params.get("hub.challenge")
         if token == platform:
             return Response(content=challenge)
         return Response(content="Invalid verification token", status_code=403)
 
-    if request.method == "POST":
-        try:
-            data = await request.json()
-            print(f"🚀 [{platform}] FastAPI Webhook JSON: {json.dumps(data)}", flush=True)
+    # ── POST: Incoming messages ───────────────────────────────────────────────
+    try:
+        data = await request.json()
+        print(f"🚀 [{platform}] Payload: {json.dumps(data)}", flush=True)
 
-            if platform == "fb":
-                entry = data.get("entry", [])
-                if not entry:
-                    print("⚠️ No entry found in Facebook webhook", flush=True)
-                    return {"status": "no_entry"}
+        if platform == "fb":
+            entry = data.get("entry", [])
+            if not entry:
+                return {"status": "no_entry"}
 
-                entry0 = entry[0]
-                account_id = entry0.get("id")
+            entry0     = entry[0]
+            account_id = entry0.get("id")
 
-                account = await sync_check_account("fb", account_id)
-                if not account:
-                    print(f"❌ [Facebook] No active profile found for {account_id}", flush=True)
-                    return {"status": "no_profile"}
+            account = await sync_check_account("fb", account_id)
+            if not account:
+                print(f"❌ No FB account for id={account_id}", flush=True)
+                return {"status": "no_profile"}
+            print(f"✅ [FB] Account: {account.name or account.account_id}", flush=True)
 
-                print(f"✅ [Facebook] Account found: {account.name or account.account_id}", flush=True)
+            messaging = entry0.get("messaging", [])
+            if not messaging:
+                return {"status": "no_messaging"}
 
-                messaging = entry0.get("messaging", [])
-                if not messaging:
-                    print("⚠️ No messaging events found", flush=True)
-                    return {"status": "no_messaging"}
+            msg_event = messaging[0]
+            mid       = msg_event.get("message", {}).get("mid")
 
-                msg_event = messaging[0]
-                mid = msg_event.get("message", {}).get("mid")
+            # ── Deduplicate ──
+            if mid in PROCESSED_MIDS:
+                print(f"⏭️  Already processed: {mid}", flush=True)
+                return {"status": "already_processed"}
+            PROCESSED_MIDS[mid] = True
+            if len(PROCESSED_MIDS) > MAX_MIDS:
+                PROCESSED_MIDS.popitem(last=False)  # evict OLDEST
 
-                # 🛑 Deduplicate: skip already-processed message IDs
-                if mid in PROCESSED_MIDS:
-                    print(f"⏭️ [fb] Skipping already processed: {mid}", flush=True)
-                    return {"status": "already_processed"}
+            sender_id = msg_event.get("sender", {}).get("id")
+            message   = msg_event.get("message", {})
 
-                PROCESSED_MIDS.add(mid)
-                if len(PROCESSED_MIDS) > 100:
-                    PROCESSED_MIDS.pop()
+            # ── Skip echoes & self-sends ──
+            if message.get("is_echo") or sender_id == account_id:
+                print(f"🤫 Echo/self from {sender_id} — skipping", flush=True)
+                return {"status": "ignored_echo"}
 
-                sender_id = msg_event.get("sender", {}).get("id")
-                recipient_id = msg_event.get("recipient", {}).get("id")
-                message = msg_event.get("message", {})
+            client_id   = sender_id
+            text        = message.get("text", "")
+            attachments = message.get("attachments", [])
+            media_url   = None
+            media_type  = None
 
-                # 🛡️ Guard against Echo Messages and Meta Auto-Replies
-                if message.get("is_echo") or sender_id == account_id:
-                    print(f"🤫 [fb] Ignoring echo from {sender_id}", flush=True)
-                    return {"status": "ignored_echo"}
+            if attachments:
+                att        = attachments[0]
+                media_url  = att.get("payload", {}).get("url")
+                media_type = att.get("type")  # image / audio / video
+                print(f"📎 {media_type}: {media_url}", flush=True)
 
-                client_id = sender_id
-                text = message.get("text", "")
-                attachments = message.get("attachments", [])
+            if not text and not media_url:
+                return {"status": "no_content"}
 
-                media_url = None
-                media_type = None
+            log_in = text if text else f"[{media_type}]"
+            print(f"📘 From {client_id}: {log_in}", flush=True)
 
-                if attachments:
-                    att = attachments[0]
-                    media_url = att.get("payload", {}).get("url")
-                    media_type = att.get("type")  # 'image', 'audio', 'video'
-                    print(f"📎 [{platform}] Received {media_type}: {media_url}", flush=True)
+            # ── Generate AI reply ─────────────────────────────────────────────
+            ai_reply = await generate_ai_reply(
+                text, account_id, media_url, media_type, sender_id=client_id
+            )
 
-                if text or media_url:
-                    incoming_log = text if text else f"[{media_type} attachment]"
-                    print(f"📘 [{platform}] Message from {client_id}: {incoming_log}", flush=True)
+            # ── Parse IMAGE_URLS tag ──────────────────────────────────────────
+            actual_text      = ai_reply
+            extracted_images = []
+            if "IMAGE_URLS:" in ai_reply:
+                parts       = ai_reply.split("IMAGE_URLS:", 1)
+                actual_text = parts[0].strip()
+                extracted_images = [
+                    u.strip() for u in parts[1].split(",") if u.strip()
+                ]
 
-                    # 🤖 GENERATE AI REPLY (with conversation memory + visual search)
-                    print(f"🤖 Generating AI reply for: '{incoming_log}'...", flush=True)
-                    ai_reply = await generate_ai_reply(
-                        text, account_id, media_url, media_type, sender_id=client_id
+            # ── Send to Facebook ──────────────────────────────────────────────
+            await send_facebook_message(
+                client_id, actual_text, extracted_images, account.token
+            )
+
+            # ── Save to conversation DB ───────────────────────────────────────
+            try:
+                def save_messages():
+                    acc  = SocialAccount.objects.get(account_id=account_id)
+                    conv, _ = Conversation.objects.get_or_create(
+                        account=acc, sender_id=client_id
                     )
+                    # Clean content — NEVER store raw CDN URLs (causes image loop bug)
+                    if text:
+                        user_content = text
+                    elif media_type == "image":
+                        user_content = "[User sent a product image]"
+                    elif media_type == "audio":
+                        user_content = "[User sent a voice message]"
+                    else:
+                        user_content = f"[User sent {media_type}]"
 
-                    # Parse IMAGE_URLS tag from reply
-                    actual_text = ai_reply
-                    extracted_images = []
-                    if "IMAGE_URLS:" in ai_reply:
-                        parts = ai_reply.split("IMAGE_URLS:")
-                        actual_text = parts[0].strip()
-                        extracted_images = [u.strip() for u in parts[1].split(",") if u.strip()]
+                    Message.objects.create(
+                        conversation=conv, role="user",
+                        content=user_content, media_url=None, media_type=media_type,
+                    )
+                    Message.objects.create(
+                        conversation=conv, role="assistant", content=actual_text,
+                    )
+                    conv.save()
 
-                    # 📤 Send reply to Facebook
-                    if account:
-                        await send_facebook_message(client_id, actual_text, extracted_images, account.token)
+                await sync_to_async(save_messages)()
+                print("💾 [Memory] Saved.", flush=True)
+            except Exception as e:
+                print(f"⚠️ [Memory] Save failed: {e}", flush=True)
 
-                    # 💾 Save to conversation history DB
-                    try:
-                        def save_messages():
-                            acc = SocialAccount.objects.get(account_id=account_id)
-                            conv, _ = Conversation.objects.get_or_create(account=acc, sender_id=client_id)
-                            # ✅ Save user message as clean text - NEVER store raw media URLs
-                            # Storing raw FB CDN URLs in history causes AI to send them back as product images
-                            if text:
-                                user_content = text
-                            elif media_type == "image":
-                                user_content = "[User sent a product image for search]"
-                            elif media_type == "audio":
-                                user_content = "[User sent a voice message]"
-                            else:
-                                user_content = f"[User sent {media_type} attachment]"
-                            Message.objects.create(
-                                conversation=conv,
-                                role="user",
-                                content=user_content,
-                                media_url=None,       # ✅ Do NOT store CDN URL in history content
-                                media_type=media_type,
-                            )
-                            # AI reply
-                            Message.objects.create(
-                                conversation=conv,
-                                role="assistant",
-                                content=actual_text,
-                            )
-                            conv.save()  # Update updated_at
+            print(
+                f"✨ Reply sent: {actual_text[:80]}... "
+                f"(+{len(extracted_images)} images)",
+                flush=True,
+            )
 
-                        await sync_to_async(save_messages)()
-                        print(f"💾 [Memory] Saved messages to conversation.", flush=True)
-                    except Exception as e:
-                        print(f"⚠️ [Memory] Save failed: {e}", flush=True)
+        return {"status": "received"}
 
-                    print(f"✨ AI REPLY SENT: {actual_text} (Images: {len(extracted_images)})", flush=True)
-
-            return {"status": "received"}
-
-        except Exception as e:
-            print(f"❌ CRITICAL WEBHOOK ERROR ({platform}): {str(e)}", flush=True)
-            return {"status": "error", "message": str(e)}
+    except Exception as e:
+        print(f"❌ WEBHOOK ERROR [{platform}]: {e}", flush=True)
+        return {"status": "error", "message": str(e)}
 
 
-# Keep Django version for debugging
+# ── Django fallback (debug only) ──────────────────────────────────────────────
 @csrf_exempt
 def unified_webhook(request, platform):
-    print(f"⚠️ [Django Fallback] Webhook hit Django view! Platform: {platform}", flush=True)
-    return JsonResponse({"message": "This request was handled by Django. Please check ASGI config."})
+    print(f"⚠️ [Django Fallback] platform={platform}", flush=True)
+    return JsonResponse({"message": "Handled by Django fallback — check ASGI config."})

@@ -1,93 +1,141 @@
 use pyo3::prelude::*;
-use reqwest::blocking::Client;
-use serde_json::{json, Value};
-use std::time::Duration;
 use serde::Deserialize;
+use serde_json::Value;
+
+// ── Data structures ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct PostImage {
+    url: Option<String>,
+    #[serde(default)]
+    hash: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct Post {
     post_id: String,
     caption: String,
+    #[serde(default)]
     vector: Option<Vec<f32>>,
+    #[serde(default)]
+    images: Vec<PostImage>,
 }
+
+// ── Cosine similarity ─────────────────────────────────────────────────────────
 
 fn cosine_similarity(v1: &[f32], v2: &[f32]) -> f32 {
-    if v1.len() != v2.len() || v1.is_empty() { return 0.0; }
-    let mut dot_product = 0.0;
-    let mut norm_a = 0.0;
-    let mut norm_b = 0.0;
-    for i in 0..v1.len() {
-        dot_product += v1[i] * v2[i];
-        norm_a += v1[i] * v1[i];
-        norm_b += v2[i] * v2[i];
+    if v1.len() != v2.len() || v1.is_empty() {
+        return 0.0;
     }
-    if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
-    dot_product / (norm_a.sqrt() * norm_b.sqrt())
+    let mut dot = 0.0_f32;
+    let mut na  = 0.0_f32;
+    let mut nb  = 0.0_f32;
+    for i in 0..v1.len() {
+        dot += v1[i] * v2[i];
+        na  += v1[i] * v1[i];
+        nb  += v2[i] * v2[i];
+    }
+    if na == 0.0 || nb == 0.0 { return 0.0; }
+    dot / (na.sqrt() * nb.sqrt())
 }
 
+// ── search_context ────────────────────────────────────────────────────────────
+// Returns ranked product context string including image URLs.
+// Called from Python webhook for every text/audio query.
+
 #[pyfunction]
-fn search_context(query_vector_json: String, posts_json: String, limit: usize) -> PyResult<String> {
-    let query_vec: Vec<f32> = serde_json::from_str(&query_vector_json).unwrap_or(vec![]);
-    let posts: Vec<Post> = serde_json::from_str(&posts_json).unwrap_or(vec![]);
+fn search_context(
+    query_vector_json: String,
+    posts_json: String,
+    limit: usize,
+) -> PyResult<String> {
+    let query_vec: Vec<f32> = serde_json::from_str(&query_vector_json).unwrap_or_default();
+    let posts: Vec<Post>    = serde_json::from_str(&posts_json).unwrap_or_default();
 
-    let mut scored_posts: Vec<(f32, String)> = posts.into_iter()
+    if query_vec.is_empty() {
+        return Ok(String::new());
+    }
+
+    // Score every post that has a vector
+    let mut scored: Vec<(f32, &Post)> = posts.iter()
         .filter_map(|p| {
-            if let Some(v) = p.vector {
-                let score = cosine_similarity(&query_vec, &v);
-                Some((score, p.caption))
-            } else { None }
-        }).collect();
+            p.vector.as_ref().map(|v| (cosine_similarity(&query_vec, v), p))
+        })
+        .collect();
 
-    scored_posts.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort descending by similarity
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut context = String::new();
-    for (score, caption) in scored_posts.iter().take(limit) {
-        if *score > 0.45 {
-            context.push_str(&format!("- Product Info (Match Confidence: {:.2}): {}\n", score, caption));
+    let mut count   = 0;
+
+    for (score, post) in scored.iter().take(limit * 2) {   // over-fetch, filter below
+        if *score < 0.45 { break; }   // below threshold — stop (already sorted)
+
+        // Collect valid image URLs for this post
+        let img_urls: Vec<&str> = post.images.iter()
+            .filter_map(|i| i.url.as_deref())
+            .filter(|u| !u.is_empty())
+            .collect();
+
+        // Build context line
+        context.push_str(&format!(
+            "---\nProduct (Match Confidence: {:.2}):\n{}\n",
+            score, post.caption
+        ));
+        if !img_urls.is_empty() {
+            context.push_str(&format!("Image URLs: {}\n", img_urls.join(", ")));
         }
+
+        count += 1;
+        if count >= limit { break; }
     }
+
     Ok(context)
 }
 
+// ── get_best_match ────────────────────────────────────────────────────────────
+// Returns the single best matching post as JSON (score + caption + images).
+// Useful for direct product lookups.
+
 #[pyfunction]
-fn generate_reply(api_key: String, user_msg_json: String, posts: String) -> PyResult<String> {
-    let client = Client::builder().timeout(Duration::from_secs(30)).build()
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+fn get_best_match(query_vector_json: String, posts_json: String) -> PyResult<String> {
+    let query_vec: Vec<f32> = serde_json::from_str(&query_vector_json).unwrap_or_default();
+    let posts: Vec<Post>    = serde_json::from_str(&posts_json).unwrap_or_default();
 
-    let input: Value = serde_json::from_str(&user_msg_json).unwrap_or(json!({}));
-    let query_vector: Vec<f32> = input["vector"].as_array()
-        .map(|v| v.iter().filter_map(|val| val.as_f64().map(|f| f as f32)).collect())
-        .unwrap_or_else(|| vec![]);
-    
-    let user_message = input["text"].as_str().unwrap_or("");
-    let context = search_context(serde_json::to_string(&query_vector).unwrap(), posts, 5)?;
+    if query_vec.is_empty() || posts.is_empty() {
+        return Ok(String::new());
+    }
 
-    let system_prompt = format!(
-        "You are a human shop assistant. ONLY use this context:\n{}\nRules: No JSON, no fake prices, say 'I don't know' if not found.",
-        context
-    );
+    let best = posts.iter()
+        .filter_map(|p| {
+            p.vector.as_ref().map(|v| (cosine_similarity(&query_vec, v), p))
+        })
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    let payload = json!({
-        "model": "google/gemini-2.0-flash-001",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ]
-    });
+    if let Some((score, post)) = best {
+        let img_urls: Vec<Value> = post.images.iter()
+            .filter_map(|i| i.url.as_ref())
+            .map(|u| Value::String(u.clone()))
+            .collect();
 
-    let response = client.post("https://openrouter.ai/api/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&payload).send()
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
-
-    let res: Value = response.json().map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
-    let content = res["choices"][0]["message"]["content"].as_str().unwrap_or("Error").to_string();
-    Ok(content)
+        let result = serde_json::json!({
+            "score":   score,
+            "caption": post.caption,
+            "post_id": post.post_id,
+            "images":  img_urls,
+        });
+        Ok(result.to_string())
+    } else {
+        Ok(String::new())
+    }
 }
+
+// ── Module registration ───────────────────────────────────────────────────────
 
 #[pymodule]
 fn rust_ai(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(search_context, m)?)?;
-    m.add_function(wrap_pyfunction!(generate_reply, m)?)?;
+    m.add_function(wrap_pyfunction!(get_best_match, m)?)?;
     Ok(())
 }

@@ -50,7 +50,7 @@ def detect_is_product(post) -> bool:
             return False
     except Exception as e:
         print(f"❌ [ProductDetect] Exception: {e}")
-        return False
+        return True   # Conservative: treat as product so nothing is silently dropped
 
 
 def subscribe_page_to_webhook(page_id, page_access_token,page_name):
@@ -74,7 +74,7 @@ def subscribe_page_to_webhook(page_id, page_access_token,page_name):
         return False
 
 
-def chec_subscription(company):
+def check_subscription(company):
     pass
 
 
