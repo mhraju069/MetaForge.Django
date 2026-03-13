@@ -526,7 +526,7 @@ async def unified_webhook_fastapi(platform: str, request: Request):
     # ── POST: Incoming messages ───────────────────────────────────────────────
     try:
         data = await request.json()
-        print(f"🚀 [{platform}] Payload: {json.dumps(data)}", flush=True)
+        # print(f"🚀 [{platform}] Payload: {json.dumps(data)}", flush=True)
 
         if platform in ["fb", "ig"]:
             entry = data.get("entry", [])

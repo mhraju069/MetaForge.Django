@@ -131,11 +131,33 @@ fn get_best_match(query_vector_json: String, posts_json: String) -> PyResult<Str
     }
 }
 
+#[pyfunction]
+fn fetch_meta_data(url: String, access_token: String) -> PyResult<String> {
+    let client = reqwest::blocking::Client::new();
+    let resp = client.get(url)
+        .query(&[("access_token", access_token), ("limit", "50".to_string())])
+        .send();
+
+    match resp {
+        Ok(res) => {
+            if res.status().is_success() {
+                let body = res.text().unwrap_or_default();
+                Ok(body)
+            } else {
+                let err_msg = res.text().unwrap_or_default();
+                Ok(format!(r#"{{"error": "API status {}", "details": {}}}"#, res.status(), err_msg))
+            }
+        }
+        Err(e) => Ok(format!(r#"{{"error": "Request failed: {}"}}"#, e)),
+    }
+}
+
 // ── Module registration ───────────────────────────────────────────────────────
 
 #[pymodule]
 fn rust_ai(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(search_context, m)?)?;
     m.add_function(wrap_pyfunction!(get_best_match, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_meta_data, m)?)?;
     Ok(())
 }

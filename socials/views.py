@@ -4,7 +4,7 @@ import urllib.parse
 import httpx
 import anyio
 from uuid import UUID
-from fastapi import APIRouter, Request, Response, Depends, HTTPException
+from fastapi import APIRouter, Request, Response, Depends, HTTPException, BackgroundTasks
 from asgiref.sync import sync_to_async
 from django.conf import settings
 from .models import SocialAccount, SocialPost, PostMedia
@@ -117,7 +117,7 @@ async def get_social_accounts(request: Request):
 
 
 @router.get("/fetch-posts/{account_id}/")
-async def fetch_posts(account_id: str, request: Request):
+async def fetch_posts(account_id: str, request: Request, background_tasks: BackgroundTasks):
     user = await get_authenticated_user(request)
     if not user:
         return {"error": "Not authenticated"}
@@ -130,162 +130,125 @@ async def fetch_posts(account_id: str, request: Request):
         return {"error": f"Account not found: {str(e)}"}
 
     if account.platform == "fb":
-        return await sync_facebook_all_posts(account)
+        background_tasks.add_task(sync_facebook_all_posts, account)
     elif account.platform == "ig":
-        return await sync_instagram_all_posts(account)
+        background_tasks.add_task(sync_instagram_all_posts, account)
+    else:
+        return {"error": "Platform not supported for fetching posts"}
     
-    return {"error": "Platform not supported for fetching posts"}
-
-
-    return {"error": "Platform not supported for fetching posts"}
+    return {"status": "sync_started", "message": f"Fetching posts for {account.name or account.platform} in background..."}
 
 
 async def sync_facebook_all_posts(account):
-    """Sync all posts from a Facebook Page."""
-    async with httpx.AsyncClient() as client:
-        # Decrypt token if encrypted
-        access_token = decrypt_data(account.token)
-        
-        # fields: id, message (caption), full_picture, attachments (image/sub-images)
-        fb_url = f"https://graph.facebook.com/v20.0/{account.account_id}/posts"
-        params = {
-            "fields": "id,message,created_time,full_picture,attachments{media_type,media,subattachments}",
-            "access_token": access_token,
-            "limit": 50
-        }
-        
-        resp = await client.get(fb_url, params=params)
-        data = resp.json()
-        print(f"🚀 [Facebook API Response Data]: {json.dumps(data, indent=2)}")
-        
+    """Sync all posts from a Facebook Page using Rust for fast fetching."""
+    # Decruit token if encrypted
+    access_token = decrypt_data(account.token)
+    
+    # Use Rust for faster fetching
+    # fields: id, message (caption), created_time, full_picture, attachments (image/sub-images)
+    fb_url = f"https://graph.facebook.com/v20.0/{account.account_id}/posts?fields=id,message,created_time,full_picture,attachments{{media_type,media,subattachments}}"
+    
+    try:
+        if rust_ai and hasattr(rust_ai, "fetch_meta_data"):
+            # Call Rust sync helper (blocking call wrapped in anyio for safety)
+            raw_data = await anyio.to_thread.run_sync(rust_ai.fetch_meta_data, fb_url, access_token)
+            data = json.loads(raw_data)
+        else:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(fb_url, params={"access_token": access_token, "limit": 50})
+                data = resp.json()
+
         if "data" not in data:
-            return {"error": "FB API Error", "details": data}
+            print(f"❌ [Facebook Sync Error]: {data}")
+            return
         
-        fetched_count = 0
         for item in data["data"]:
             post_id = item.get("id")
             caption = item.get("message", "") # FB calls it message
-            print(f"📝 Saving FB Post: {post_id} | Caption: {caption[:50]}...")
-
-            # --- GENERATE VECTOR ---
-            vector = await generate_vector(caption)
-            if vector:
-                print(f"🧬 Generated Vector for FB Post: {post_id}")
-
-            # 1. Update/Create post
+            
+            # 1. Update/Create post (Signals will handle is_product logic and vectors in background)
             post, created = await sync_to_async(SocialPost.objects.update_or_create)(
                 account=account,
                 post_id=post_id,
-                defaults={"caption": caption, "vector": vector}
+                defaults={"caption": caption}
             )
-            print(f"✅ Post {'Created' if created else 'Updated'}: {post_id}")
 
             # 2. Media Handling
             media_urls = set()
-            
-            # Check attachments for images/carousels (Prioritize attachments)
             attachments = item.get("attachments", {}).get("data", [])
             if attachments:
                 for att in attachments:
-                    # If it's a carousel (album), it has subattachments
                     sub = att.get("subattachments", {}).get("data", [])
                     if sub:
-                        print(f"📦 Found Carousel (Album) with {len(sub)} items")
                         for s in sub:
                             src = s.get("media", {}).get("image", {}).get("src")
                             if src: media_urls.add(src)
                     else:
-                        # Single image/video attachment
                         src = att.get("media", {}).get("image", {}).get("src")
                         if src: media_urls.add(src)
             
-            # If no attachments found, fallback to full_picture
             if not media_urls and item.get("full_picture"):
                 media_urls.add(item["full_picture"])
 
-            # 3. Save media links
-            media_count = 0
             for m_url in media_urls:
-                _, m_created = await sync_to_async(PostMedia.objects.get_or_create)(
+                await sync_to_async(PostMedia.objects.get_or_create)(
                     post=post,
                     media_url=m_url
                 )
-                if m_created: media_count += 1
-            
-            if media_count > 0:
-                print(f"🖼️ Saved {media_count} new media items for post {post_id}")
+        print(f"✅ Finished syncing {len(data['data'])} FB posts for {account.name}")
 
-            fetched_count += 1
-
-        return {"status": "success", "count": fetched_count}
+    except Exception as e:
+        print(f"⚠️ [Facebook Sync Exception]: {e}")
 
 
 async def sync_instagram_all_posts(account):
-    """Sync all media from Instagram Business Account."""
-    async with httpx.AsyncClient() as client:
-        # Decrypt token if encrypted
-        access_token = decrypt_data(account.token)
+    """Sync all media from Instagram using Rust for fast fetching."""
+    # Decrypt token if encrypted
+    access_token = decrypt_data(account.token)
 
-        # Use graph.instagram.com for Basic Display API tokens
-        url = f"https://graph.instagram.com/{account.account_id}/media"
-        params = {
-            "fields": "id,caption,media_type,media_url,thumbnail_url,children{media_url,media_type}",
-            "access_token": access_token,
-            "limit": 50
-        }
-        
-        resp = await client.get(url, params=params)
-        data = resp.json()
-        print(f"📸 [Instagram API Response Data]: {json.dumps(data, indent=2)}")
-        
+    # Use Rust for faster fetching
+    url = f"https://graph.instagram.com/{account.account_id}/media?fields=id,caption,media_type,media_url,thumbnail_url,children{{media_url,media_type}}"
+    
+    try:
+        if rust_ai and hasattr(rust_ai, "fetch_meta_data"):
+            raw_data = await anyio.to_thread.run_sync(rust_ai.fetch_meta_data, url, access_token)
+            data = json.loads(raw_data)
+        else:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, params={"access_token": access_token, "limit": 50})
+                data = resp.json()
+
         if "data" not in data:
-            return {"error": "IG API Error", "details": data}
+            print(f"❌ [Instagram Sync Error]: {data}")
+            return
         
-        fetched_count = 0
         for item in data["data"]:
             post_id = item.get("id")
             caption = item.get("caption", "")
-            print(f"📝 Saving IG Post: {post_id} | Caption: {caption[:50]}...")
-
-            # --- GENERATE VECTOR ---
-            vector = await generate_vector(caption)
-            if vector:
-                print(f"🧬 Generated Vector for IG Post: {post_id}")
 
             post, created = await sync_to_async(SocialPost.objects.update_or_create)(
                 account=account,
                 post_id=post_id,
-                defaults={"caption": caption, "vector": vector}
+                defaults={"caption": caption}
             )
-            print(f"✅ Post {'Created' if created else 'Updated'}: {post_id}")
 
-            # Media Handling
             media_urls = set()
-            
-            # For carousels (Prioritize children)
             children = item.get("children", {}).get("data", [])
             if children:
-                print(f"📦 Found Instagram Carousel with {len(children)} items")
                 for child in children:
                     if child.get("media_url"): media_urls.add(child["media_url"])
             elif item.get("media_url"):
-                # Single photo/video
                 media_urls.add(item["media_url"])
                 
-            media_count = 0
             for m_url in media_urls:
-                _, m_created = await sync_to_async(PostMedia.objects.get_or_create)(
+                await sync_to_async(PostMedia.objects.get_or_create)(
                     post=post,
                     media_url=m_url
                 )
-                if m_created: media_count += 1
-            
-            if media_count > 0:
-                print(f"🖼️ Saved {media_count} new media items for post {post_id}")
+        print(f"✅ Finished syncing {len(data['data'])} IG posts for {account.name}")
 
-            fetched_count += 1
-
-        return {"status": "success", "count": fetched_count}
+    except Exception as e:
+        print(f"⚠️ [Instagram Sync Exception]: {e}")
 
 
 @router.get("/connect/fb/")
