@@ -12,6 +12,7 @@ from django.utils import timezone
 from .models import *
 from .helper import *
 from .image_search import compute_phash_from_url, find_best_visual_match
+from core.utils import decrypt_data
 
 # ── Rust bridge ───────────────────────────────────────────────────────────────
 try:
@@ -78,9 +79,9 @@ async def send_facebook_message(
     message_text: str,
     images: list = None,
     access_token: str = "",
-                        ):
+):
     if not access_token:
-        print("❌ Cannot send message: No access token.")
+        print("❌ Cannot send message: No FB access token.")
         return
 
     fb_url = f"https://graph.facebook.com/v20.0/me/messages?access_token={access_token}"
@@ -119,6 +120,56 @@ async def send_facebook_message(
                         print(f"✅ [FB] Image sent: {img_url[:60]}...")
                 except Exception as e:
                     print(f"❌ FB image send error: {e}")
+
+
+async def send_instagram_message(
+    recipient_id: str,
+    message_text: str,
+    images: list = None,
+    access_token: str = "",
+):
+    """Send message to Instagram Business account via Facebook Graph API."""
+    if not access_token:
+        print("❌ Cannot send message: No IG access token.")
+        return
+
+    # Instagram messaging uses the same FB Graph API endpoint
+    ig_url = f"https://graph.facebook.com/v20.0/me/messages?access_token={access_token}"
+
+    async with httpx.AsyncClient() as client:
+        # Text message
+        if message_text:
+            try:
+                resp = await client.post(ig_url, json={
+                    "recipient": {"id": recipient_id},
+                    "message":   {"text": message_text},
+                }, timeout=10.0)
+                if resp.status_code != 200:
+                    print(f"❌ IG Text Error: {resp.status_code} - {resp.text}")
+                else:
+                    print(f"✅ [IG] Text sent to {recipient_id}")
+            except Exception as e:
+                print(f"❌ IG text send error: {e}")
+
+        # Image attachments
+        if images:
+            for img_url in images:
+                try:
+                    resp = await client.post(ig_url, json={
+                        "recipient": {"id": recipient_id},
+                        "message": {
+                            "attachment": {
+                                "type": "image",
+                                "payload": {"url": img_url},
+                            }
+                        },
+                    }, timeout=10.0)
+                    if resp.status_code != 200:
+                        print(f"❌ IG Image Error: {resp.status_code} - {resp.text}")
+                    else:
+                        print(f"✅ [IG] Image sent: {img_url[:60]}...")
+                except Exception as e:
+                    print(f"❌ IG image send error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -477,7 +528,7 @@ async def unified_webhook_fastapi(platform: str, request: Request):
         data = await request.json()
         print(f"🚀 [{platform}] Payload: {json.dumps(data)}", flush=True)
 
-        if platform == "fb":
+        if platform in ["fb", "ig"]:
             entry = data.get("entry", [])
             if not entry:
                 return {"status": "no_entry"}
@@ -485,11 +536,11 @@ async def unified_webhook_fastapi(platform: str, request: Request):
             entry0     = entry[0]
             account_id = entry0.get("id")
 
-            account = await sync_check_account("fb", account_id)
+            account = await sync_check_account(platform, account_id)
             if not account:
-                print(f"❌ No FB account for id={account_id}", flush=True)
+                print(f"❌ No {platform.upper()} account for id={account_id}", flush=True)
                 return {"status": "no_profile"}
-            print(f"✅ [FB] Account: {account.name or account.account_id}", flush=True)
+            print(f"✅ [{platform.upper()}] Account: {account.name or account.account_id}", flush=True)
 
             messaging = entry0.get("messaging", [])
             if not messaging:
@@ -530,7 +581,7 @@ async def unified_webhook_fastapi(platform: str, request: Request):
                 return {"status": "no_content"}
 
             log_in = text if text else f"[{media_type}]"
-            print(f"📘 From {client_id}: {log_in}", flush=True)
+            print(f"📘 [{platform.upper()}] From {client_id}: {log_in}", flush=True)
 
             # ── Generate AI reply ─────────────────────────────────────────────
             ai_reply = await generate_ai_reply(
@@ -547,10 +598,15 @@ async def unified_webhook_fastapi(platform: str, request: Request):
                     u.strip() for u in parts[1].split(",") if u.strip()
                 ]
 
-            # ── Send to Facebook ──────────────────────────────────────────────
-            await send_facebook_message(
-                client_id, actual_text, extracted_images, account.token
-            )
+            # ── Send Reply ───────────────────────────────────────────────────
+            if platform == "fb":
+                await send_facebook_message(
+                    client_id, actual_text, extracted_images, decrypt_data(account.token)
+                )
+            elif platform == "ig":
+                await send_instagram_message(
+                    client_id, actual_text, extracted_images, decrypt_data(account.token)
+                )
 
             # ── Save to conversation DB ───────────────────────────────────────
             try:

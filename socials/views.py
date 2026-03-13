@@ -143,11 +143,14 @@ async def fetch_posts(account_id: str, request: Request):
 async def sync_facebook_all_posts(account):
     """Sync all posts from a Facebook Page."""
     async with httpx.AsyncClient() as client:
+        # Decrypt token if encrypted
+        access_token = decrypt_data(account.token)
+        
         # fields: id, message (caption), full_picture, attachments (image/sub-images)
         fb_url = f"https://graph.facebook.com/v20.0/{account.account_id}/posts"
         params = {
             "fields": "id,message,created_time,full_picture,attachments{media_type,media,subattachments}",
-            "access_token": account.token,
+            "access_token": access_token,
             "limit": 50
         }
         
@@ -220,11 +223,14 @@ async def sync_facebook_all_posts(account):
 async def sync_instagram_all_posts(account):
     """Sync all media from Instagram Business Account."""
     async with httpx.AsyncClient() as client:
+        # Decrypt token if encrypted
+        access_token = decrypt_data(account.token)
+
         # Use graph.instagram.com for Basic Display API tokens
         url = f"https://graph.instagram.com/{account.account_id}/media"
         params = {
             "fields": "id,caption,media_type,media_url,thumbnail_url,children{media_url,media_type}",
-            "access_token": account.token,
+            "access_token": access_token,
             "limit": 50
         }
         
@@ -370,7 +376,7 @@ async def facebook_callback(request: Request, code: str = None, error: str = Non
                 account, _ = await sync_update_or_create_social(
                     account_id=page_id,
                     platform="fb",
-                    defaults={"company": company, "name": page_name, "token": page_token}
+                    defaults={"company": company, "name": page_name, "token": encrypt_data(page_token)}
                 )
                 await sync_to_async(subscribe_page_to_webhook)(page_id, page_token, page_name)
                 
@@ -467,7 +473,7 @@ async def instagram_callback(request: Request, code: str = None, error: str = No
         account, _ = await sync_update_or_create_social(
             platform='ig',
             company=company,
-            defaults={"account_id": final_ig_id, "name": username, "token": long_lived_token}
+            defaults={"account_id": final_ig_id, "name": username, "token": encrypt_data(long_lived_token)}
         )
 
         # Step 4: Subscribe
