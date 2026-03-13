@@ -220,8 +220,8 @@ async def sync_facebook_all_posts(account):
 async def sync_instagram_all_posts(account):
     """Sync all media from Instagram Business Account."""
     async with httpx.AsyncClient() as client:
-        # https://developers.facebook.com/docs/instagram-api/reference/ig-user/media/
-        url = f"https://graph.facebook.com/v20.0/{account.account_id}/media"
+        # Use graph.instagram.com for Basic Display API tokens
+        url = f"https://graph.instagram.com/{account.account_id}/media"
         params = {
             "fields": "id,caption,media_type,media_url,thumbnail_url,children{media_url,media_type}",
             "access_token": account.token,
@@ -431,6 +431,8 @@ async def instagram_callback(request: Request, code: str = None, error: str = No
 
     async with httpx.AsyncClient() as client:
         redirect_uri = str(request.url).split("?")[0]
+        if "ngrok" in redirect_uri and redirect_uri.startswith("http://"):
+            redirect_uri = redirect_uri.replace("http://", "https://")
         if not redirect_uri.endswith('/'): redirect_uri += '/'
         
         # Step 1: Exchange code

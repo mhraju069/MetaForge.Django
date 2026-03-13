@@ -78,7 +78,7 @@ async def send_facebook_message(
     message_text: str,
     images: list = None,
     access_token: str = "",
-):
+                        ):
     if not access_token:
         print("❌ Cannot send message: No access token.")
         return
@@ -169,7 +169,7 @@ async def generate_ai_reply(
     media_url: str = None,
     media_type: str = None,
     sender_id: str = None,
-) -> str:
+        ) -> str:
     """
     Full pipeline:
     1.  DB fetch  — product posts + company info
